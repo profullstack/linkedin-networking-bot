@@ -186,7 +186,6 @@ async function launchBrowser() {
   console.log('Launching browser');
   const browser = await puppeteer.launch({ 
     headless: true,
-    executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     args: [
       '--window-size=1280,800',
       '--disable-web-security',
@@ -680,301 +679,36 @@ async function sendOneFollowUpMessage(page) {
 
 async function checkForSmsVerification(page) {
   try {
-    console.log('Checking for SMS verification...');
-    
-    // Check if we're on a verification page
-    const isVerificationPage = await page.evaluate(() => {
-      const pageText = document.body.innerText.toLowerCase();
-      
-      // Log the entire page text for debugging
-      console.log('Page text for verification detection:', pageText);
-      
-      const isVerify = pageText.includes('verification') || 
-             pageText.includes('verify') || 
-             pageText.includes('security check') || 
-             pageText.includes('confirm') ||
-             pageText.includes('two-step') ||
-             pageText.includes('2-step') ||
-             pageText.includes('two step') ||
-             pageText.includes('2 step');
-             
-      console.log(`Is verification page detected: ${isVerify}`);
-      return isVerify;
-    });
-    
-    if (isVerificationPage) {
-      console.log('Detected verification page. Taking screenshot...');
-      await saveScreenshot(page, 'verification-page', 'verification page');
-      
-      // Log all buttons on the page for debugging
-      await page.evaluate(() => {
-        const allButtons = Array.from(document.querySelectorAll('button'));
-        console.log(`Found ${allButtons.length} buttons on verification page`);
-        allButtons.forEach((btn, i) => {
-          console.log(`Button ${i}: ${btn.innerText || btn.textContent || 'No text'} - ${btn.getAttribute('id') || 'No ID'} - ${btn.getAttribute('class') || 'No class'}`);
-        });
-        
-        // Dump the entire HTML for debugging
-        // console.log('HTML dump of verification page:');
-        //console.log(document.body.innerHTML);
-      });
-      
-      // Set a timeout to prevent hanging indefinitely
-      const verificationTimeout = setTimeout(() => {
-        console.log('TIMEOUT: Verification page is taking too long. Proceeding with manual intervention prompt...');
-        // This will be caught by the try/catch and allow the function to continue
-        throw new Error('Verification timeout');
-      }, 30000); // 30 second timeout
-      
-      // Try a direct approach to find and click the 'Verify using SMS' button
-      console.log('Attempting direct click on "Verify using SMS" button...');
-      
-      // First, try direct JavaScript execution to find and click the button
-      let directClickResult = await page.evaluate(() => {
-        // Try multiple approaches to find the button
-        
-        // 1. Try exact text match (case insensitive)
-        const buttonsByText = Array.from(document.querySelectorAll('button, a'));
-        for (const btn of buttonsByText) {
-          const text = (btn.innerText || btn.textContent || '').trim();
-          console.log(`Checking button: "${text}"`);
-          
-          if (text.toLowerCase() === 'verify using sms') {
-            console.log('Found exact match for "Verify using SMS"');
-            btn.click();
-            return { clicked: true, method: 'exact text match', text };
-          }
-        }
-        
-        // 2. Try contains match
-        for (const btn of buttonsByText) {
-          const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-          if (text.includes('verify') && text.includes('sms')) {
-            console.log(`Found partial match: "${text}"`);
-            btn.click();
-            return { clicked: true, method: 'partial text match', text };
-          }
-        }
-        
-        // 3. Try by class or ID patterns that might indicate a verification button
-        const verifyButtons = document.querySelectorAll('[class*="verify"], [id*="verify"], [class*="sms"], [id*="sms"]');
-        if (verifyButtons.length > 0) {
-          console.log(`Found ${verifyButtons.length} buttons with verify/sms in class/id`);
-          verifyButtons[0].click();
-          return { clicked: true, method: 'class/id match', text: verifyButtons[0].innerText };
-        }
-        
-        // Log all buttons for debugging
-        const allButtons = Array.from(document.querySelectorAll('button'));
-        console.log(`Found ${allButtons.length} total buttons on page`);
-        allButtons.forEach((btn, i) => {
-          const btnText = btn.innerText || btn.textContent || 'No text';
-          console.log(`Button ${i}: "${btnText}" - id: ${btn.id || 'none'} - class: ${btn.className || 'none'}`);
-        });
-        
-        return { clicked: false };
-      });
-      
-      console.log('Direct click result:', directClickResult);
-      let smsButtonFound = directClickResult.clicked;
-      
-      // If direct click didn't work, try with Puppeteer's built-in methods
-      if (!smsButtonFound) {
-        try {
-          // Try to find button by text content
-          await page.waitForFunction(
-            'document.querySelector("button, a") && Array.from(document.querySelectorAll("button, a")).some(el => el.innerText.includes("Verify") && el.innerText.includes("SMS"))',
-            { timeout: 5000 }
-          );
-          
-          // Click the button
-          await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll('button, a'));
-            const smsButton = buttons.find(el => el.innerText.includes('Verify') && el.innerText.includes('SMS'));
-            if (smsButton) {
-              console.log(`Clicking button with text: ${smsButton.innerText}`);
-              smsButton.click();
-              return true;
-            }
-            return false;
-          });
-          
-          console.log('Clicked SMS button using waitForFunction approach');
-          smsButtonFound = true;
-        } catch (error) {
-          console.log(`Error with waitForFunction approach: ${error.message}`);
-        }
-      }
-      
-      // If direct methods didn't work, try with explicit selectors
-      if (!smsButtonFound) {
-        // Look for SMS verification button with various possible selectors
-        const smsButtonSelectors = [
-          'button:has-text("Verify using SMS")',  // Exact match for the button we need
-          'button:has-text("verify using sms")',  // Case insensitive version
-          'button:has-text("Verify with SMS")',
-          'button[data-id="verification-code-button"]',
-          'button:has-text("SMS")',
-          'button:has-text("Text")',
-          'button:has-text("Mobile")',
-          'button:has-text("Phone")',
-          'button[aria-label*="SMS"]',
-          'button[aria-label*="Text"]',
-          'a:has-text("Verify using SMS")',
-          'a:has-text("SMS")',
-          'a:has-text("Text")',
-          'a[aria-label*="SMS"]',
-          'a[aria-label*="Text"]',
-          'button',  // Last resort: try all buttons and check their text
-        ];
-        
-        for (const selector of smsButtonSelectors) {
-          try {
-            // For the generic 'button' selector, we need to check each button's text
-            if (selector === 'button') {
-              const buttons = await page.$$('button');
-              for (let i = 0; i < buttons.length; i++) {
-                const buttonText = await page.evaluate(el => el.innerText.toLowerCase(), buttons[i]);
-                
-                // Prioritize exact match for 'Verify using SMS'
-                if (buttonText.includes('verify using sms')) {
-                  console.log(`Found exact match for 'Verify using SMS' button: ${buttonText}`);
-                  await buttons[i].click();
-                  smsButtonFound = true;
-                  break;
-                }
-                
-                // Then check for other SMS-related text
-                if (buttonText.includes('sms') || buttonText.includes('text') || buttonText.includes('phone')) {
-                  console.log(`Found SMS button with text: ${buttonText}`);
-                  await buttons[i].click();
-                  smsButtonFound = true;
-                  break;
-                }
-              }
-              if (smsButtonFound) break;
-            } else {
-              const smsButton = await page.$(selector);
-              if (smsButton) {
-                const buttonText = await page.evaluate(el => el.innerText, smsButton);
-                console.log(`Found SMS verification button with selector: ${selector}, text: ${buttonText}`);
-                await smsButton.click();
-                console.log('Clicked SMS verification button');
-                smsButtonFound = true;
-                break;
-              }
-            }
-          } catch (error) {
-            console.log(`Error with SMS button selector ${selector}: ${error.message}`);
-          }
-        }
-      }
-      
-      // Clear the timeout since we're proceeding
-      clearTimeout(verificationTimeout);
-      
-      if (!smsButtonFound) {
-        console.log('Could not automatically find the SMS verification button.');
-        console.log('Taking a screenshot to help with manual intervention...');
-        await saveScreenshot(page, 'manual-intervention', 'manual intervention');
-        
-        // Ask user for manual intervention
-        const proceed = await promptForInput('SMS button not found. Please manually click the "Verify using SMS" button in the browser, then type "done" here to continue: ');
-        
-        if (proceed.toLowerCase() === 'done') {
-          console.log('User has manually clicked the SMS button. Proceeding...');
-          smsButtonFound = true;
-        } else {
-          console.log('User did not confirm manual intervention. Aborting verification.');
-          return false;
-        }
-      }
-      
-      if (smsButtonFound) {
-        // Wait a bit after clicking the SMS button
-        await page.waitForTimeout(3000);
-        
-        // Take screenshot after clicking SMS button
-        await saveScreenshot(page, 'sms-verification', 'SMS verification');
-        
-        // Prompt user to enter SMS code
-        const smsCode = await promptForInput('Enter the SMS verification code you received: ');
-        console.log(`Received SMS code: ${smsCode}`);
-        
-        // Find and fill the SMS code input field
-        const smsInputSelectors = [
-          'input[name="pin"]',
-          'input[id="input__phone_verification_pin"]',
-          'input[id="verification-code"]',
-          'input[name="verification-code"]',
-          'input[placeholder*="code"]',
-          'input[placeholder*="verification"]',
-          'input[type="text"]',
-          'input[type="tel"]',
-          'input[inputmode="numeric"]'
-        ];
-        
-        let smsInputFound = false;
-        
-        for (const selector of smsInputSelectors) {
-          try {
-            const smsInput = await page.$(selector);
-            if (smsInput) {
-              console.log(`Found SMS input field with selector: ${selector}`);
-              await smsInput.click();
-              await page.waitForTimeout(500);
-              await smsInput.type(smsCode);
-              console.log('Entered SMS code');
-              smsInputFound = true;
-              break;
-            }
-          } catch (error) {
-            console.log(`Error with SMS input selector ${selector}: ${error.message}`);
-          }
-        }
-        
-        if (smsInputFound) {
-          // Find and click the submit button
-          const submitButtonSelectors = [
-            'button[type="submit"]',
-            'button:has-text("Submit")',
-            'button:has-text("Verify")',
-            'button:has-text("Continue")',
-            'button.primary',
-            'button.submit',
-            'button.verification-button'
-          ];
-          
-          for (const selector of submitButtonSelectors) {
-            try {
-              const submitButton = await page.$(selector);
-              if (submitButton) {
-                console.log(`Found submit button with selector: ${selector}`);
-                await submitButton.click();
-                console.log('Submitted SMS code');
-                
-                // Wait for verification to complete
-                await page.waitForTimeout(5000);
-                break;
-              }
-            } catch (error) {
-              console.log(`Error with submit button selector ${selector}: ${error.message}`);
-            }
-          }
-        } else {
-          console.log('Could not find SMS input field. You may need to enter the code manually.');
-        }
-      } else {
-        console.log('Could not find SMS verification button. You may need to verify manually.');
-        console.log('Waiting for 60 seconds for manual verification...');
-        await page.waitForTimeout(60000); // Wait for 1 minute
-      }
-      
-      // Take another screenshot after verification attempt
-      await saveScreenshot(page, 'after-verification', 'after verification attempt');
+    console.log('Starting SMS verification process...');
+    // Wait for the SMS code input field
+    const smsInput = await page.waitForSelector('input#input__phone_verification_pin', { timeout: 15000 });
+    if (!smsInput) {
+      console.log('SMS verification input not found.');
+      return false;
     }
+    // Prompt for SMS code from the user
+    const smsCode = await promptForInput('Enter the SMS verification code: ');
+    await smsInput.click();
+    await page.waitForTimeout(500);
+    await smsInput.type(smsCode, { delay: 100 });
+    console.log('SMS code entered.');
+
+    // Locate and click the submit button
+    const submitButton = await page.waitForSelector('button#two-step-submit-button', { timeout: 15000 });
+    if (!submitButton) {
+      console.log('Submit button not found.');
+      return false;
+    }
+    await submitButton.click();
+    console.log('Submitted SMS code, waiting for navigation...');
+    
+    const currentUrl = page.url();
+    const success = !currentUrl.includes('/checkpoint/challenge/');
+    console.log(`SMS verification ${success ? 'succeeded' : 'failed'}. Current URL: ${currentUrl}`);
+    return success;
   } catch (error) {
-    console.error(`Error checking for SMS verification: ${error.message}`);
+    console.error(`Error during SMS verification: ${error.message}`);
+    return false;
   }
 }
 
@@ -1165,6 +899,16 @@ async function loginWithCredentials(page, username, password) {
       return false;
     }
 
+    // Check if we've been redirected to a checkpoint/challenge page
+    const currentUrl = page.url();
+    if (currentUrl.includes('/checkpoint/challenge/')) {
+      console.log('Detected checkpoint challenge. Initiating SMS verification...');
+      await checkForSmsVerification(page);
+      return false;
+    } else {
+      console.log('No checkpoint challenge detected. Continuing with normal flow...');
+    }
+
     // Check if login was successful
     const isLoggedIn = await checkIfLoggedIn(page);
     if (!isLoggedIn) {
@@ -1174,8 +918,6 @@ async function loginWithCredentials(page, username, password) {
     }
 
     console.log('Login successful!');
-
-    checkForSmsVerification(page)
     
     return true;
     
