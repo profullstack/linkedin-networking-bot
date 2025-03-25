@@ -1032,173 +1032,341 @@ async function loginWithCredentials(page, username, password) {
     // Take a screenshot of the login page
     await saveScreenshot(page, 'login-page', 'login page');
     
-    // Use a direct JavaScript approach to fill in the login form
-    // This bypasses the need to find elements with selectors
-    console.log('Attempting to login using direct JavaScript execution...');
+    // Use Puppeteer's direct methods to interact with the page
+    console.log('Attempting to login using Puppeteer\'s direct methods...');
     
-    const loginSuccess = await page.evaluate(async (user, pass) => {
-      // Helper function to wait for an element
-      const waitForElement = (selector, timeout = 5000) => {
-        return new Promise((resolve) => {
-          if (document.querySelector(selector)) {
-            return resolve(document.querySelector(selector));
-          }
-          
-          const observer = new MutationObserver(() => {
-            if (document.querySelector(selector)) {
-              resolve(document.querySelector(selector));
-              observer.disconnect();
-            }
-          });
-          
-          observer.observe(document.body, {
-            childList: true,
-            subtree: true
-          });
-          
-          setTimeout(() => {
-            observer.disconnect();
-            resolve(document.querySelector(selector));
-          }, timeout);
-        });
-      };
+    // Check if we're already on a login page or need to click a sign-in button
+    const isOnLoginPage = await page.evaluate(() => {
+      return !!document.querySelector('#username') || 
+             !!document.querySelector('input[name="session_key"]') || 
+             !!document.querySelector('input[autocomplete="username"]');
+    });
+    
+    if (!isOnLoginPage) {
+      console.log('Not on login page yet, looking for sign-in button...');
       
-      // Helper function to wait a specified time
-      const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+      // Look for sign-in links
+      const signInButtonSelector = 'a[href*="/login"], a[data-tracking-control-name*="sign_in"], a:has-text("Sign in")';
       
       try {
-        // First check if we're already on a page with username field
-        let usernameInput = document.querySelector('#username') || 
-                           document.querySelector('input[name="session_key"]') || 
-                           document.querySelector('input[autocomplete="username"]') || 
-                           document.querySelector('input[aria-label="Email or Phone"]') || 
-                           document.querySelector('input[placeholder*="Email"]') || 
-                           document.querySelector('input[placeholder*="email"]');
-        
-        // If not found, look for any visible email/text input
-        if (!usernameInput) {
-          const allInputs = Array.from(document.querySelectorAll('input[type="text"], input[type="email"]'));
-          usernameInput = allInputs.find(input => input.offsetParent !== null);
-        }
-        
-        if (usernameInput) {
-          console.log('Found username field');
-          // Clear and fill username field
-          usernameInput.value = '';
-          await wait(500);
-          usernameInput.focus();
-          await wait(500);
-          usernameInput.value = user;
-          await wait(500);
+        await page.waitForSelector(signInButtonSelector, { timeout: 5000 });
+        console.log('Found sign-in button, clicking it...');
+        await page.click(signInButtonSelector);
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(e => {
+          console.log(`Navigation timeout after clicking sign-in: ${e.message}`);
+        });
+      } catch (error) {
+        console.log(`Could not find sign-in button: ${error.message}`);
+      }
+    }
+    
+    // Wait for the page to stabilize
+    await page.waitForTimeout(3000);
+    
+    // Take a screenshot of the login page
+    await saveScreenshot(page, 'login-page-before-username', 'Login page before entering username');
+    
+    // Try to find and fill the username field
+    console.log('Looking for username field...');
+    const usernameSelectors = [
+      '#username', 
+      'input[name="session_key"]', 
+      'input[autocomplete="username"]',
+      'input[aria-label="Email or Phone"]',
+      'input[placeholder*="Email"]',
+      'input[placeholder*="email"]'
+    ];
+    
+    let usernameEntered = false;
+    
+    for (const selector of usernameSelectors) {
+      try {
+        const usernameFieldExists = await page.$(selector);
+        if (usernameFieldExists) {
+          console.log(`Found username field with selector: ${selector}`);
+          // Clear the field first
+          await page.click(selector, { clickCount: 3 }); // Triple click to select all text
+          await page.keyboard.press('Backspace'); // Delete selected text
+          await page.waitForTimeout(500);
           
-          // Find and click the continue/next button
-          // First, get all buttons
-          const allButtons = Array.from(document.querySelectorAll('button'));
-          
-          // Filter out 'Sign in with Apple' and other OAuth buttons
-          const filteredButtons = allButtons.filter(button => {
-            const text = (button.innerText || button.textContent || '').toLowerCase();
-            // Exclude OAuth buttons
-            return !text.includes('apple') && 
-                   !text.includes('google') && 
-                   !text.includes('facebook') && 
-                   !text.includes('github');
-          });
-          
-          // Find the primary continue/next/sign in button
-          const continueButton = filteredButtons.find(button => {
-            const text = (button.innerText || button.textContent || '').toLowerCase();
-            return text.includes('continue') || text.includes('next') || text.includes('sign in');
-          });
-          
-          if (continueButton) {
-            console.log('Found continue button');
-            continueButton.click();
-            await wait(3000);
-          } else {
-            // If no continue button, try to submit the form
-            const form = usernameInput.closest('form');
-            if (form) {
-              console.log('Submitting form');
-              form.submit();
-              await wait(3000);
-            }
-          }
-          
-          // Now wait for password field to appear
-          console.log('Waiting for password field...');
-          await wait(2000); // Wait a bit before looking for password field
-          
-          // Try multiple selectors for password field
-          let passwordInput = document.querySelector('input[type="password"]') || 
-                            document.querySelector('input[name="session_password"]') || 
-                            document.querySelector('input[aria-label="Password"]') || 
-                            document.querySelector('input[placeholder="Password"]');
-          
-          // If not found immediately, wait for it
-          if (!passwordInput) {
-            console.log('Password field not found immediately, waiting...');
-            passwordInput = await waitForElement('input[type="password"]', 10000);
-          }
-          
-          if (passwordInput) {
-            console.log('Found password field');
-            // Clear and fill password field
-            passwordInput.value = '';
-            await wait(500);
-            passwordInput.focus();
-            await wait(500);
-            passwordInput.value = pass;
-            await wait(500);
-            
-            // Find and click the sign in button
-            // First, get all buttons
-            const allSignInButtons = Array.from(document.querySelectorAll('button'));
-            
-            // Filter out 'Sign in with Apple' and other OAuth buttons
-            const filteredSignInButtons = allSignInButtons.filter(button => {
-              const text = (button.innerText || button.textContent || '').toLowerCase();
-              // Exclude OAuth buttons
-              return !text.includes('apple') && 
-                     !text.includes('google') && 
-                     !text.includes('facebook') && 
-                     !text.includes('github');
-            });
-            
-            // Find the primary sign in button
-            const signInButton = filteredSignInButtons.find(button => {
-              const text = (button.innerText || button.textContent || '').toLowerCase();
-              return text.includes('sign in') || text.includes('log in') || text.includes('login');
-            });
-            
-            if (signInButton) {
-              console.log('Found sign in button');
-              signInButton.click();
-              return true;
-            } else {
-              // If no sign in button, try to submit the form
-              const form = passwordInput.closest('form');
-              if (form) {
-                console.log('Submitting password form');
-                form.submit();
-                return true;
-              }
-            }
-          } else {
-            console.log('Password field not found');
-            return false;
-          }
-        } else {
-          console.log('Username field not found');
-          return false;
+          // Type the username
+          await page.type(selector, username, { delay: 100 }); // Slower typing to mimic human
+          console.log('Entered username');
+          usernameEntered = true;
+          break;
         }
       } catch (error) {
-        console.log('Error in login script:', error.message);
-        return false;
+        console.log(`Error with selector ${selector}: ${error.message}`);
       }
+    }
+    
+    if (!usernameEntered) {
+      console.log('Could not find username field with predefined selectors, trying to find any visible text/email input...');
       
+      // Try to find any visible text/email input as a fallback
+      const visibleInputs = await page.evaluate(() => {
+        const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="email"]'));
+        const visibleInput = inputs.find(input => input.offsetParent !== null);
+        return visibleInput ? true : false;
+      });
+      
+      if (visibleInputs) {
+        try {
+          await page.evaluate((user) => {
+            const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="email"]'));
+            const visibleInput = inputs.find(input => input.offsetParent !== null);
+            if (visibleInput) {
+              visibleInput.value = '';
+              visibleInput.focus();
+            }
+          });
+          
+          await page.keyboard.type(username, { delay: 100 });
+          console.log('Entered username using fallback method');
+          usernameEntered = true;
+        } catch (error) {
+          console.log(`Error with fallback username entry: ${error.message}`);
+        }
+      }
+    }
+    
+    if (!usernameEntered) {
+      console.log('Failed to enter username');
       return false;
-    }, username, password);
+    }
+    
+    // Take a screenshot after entering username
+    await saveScreenshot(page, 'after-username-entry', 'After username entry');
+    
+    // Look for and click the continue/next button
+    console.log('Looking for continue/next button...');
+    const continueButtonSelectors = [
+      'button:has-text("Continue")',
+      'button:has-text("Next")',
+      'button:has-text("Sign in")',
+      'button[type="submit"]'
+    ];
+    
+    let continueButtonClicked = false;
+    
+    for (const selector of continueButtonSelectors) {
+      try {
+        const buttonExists = await page.$(selector);
+        if (buttonExists) {
+          console.log(`Found continue button with selector: ${selector}`);
+          await page.click(selector);
+          console.log('Clicked continue button');
+          continueButtonClicked = true;
+          break;
+        }
+      } catch (error) {
+        console.log(`Error with button selector ${selector}: ${error.message}`);
+      }
+    }
+    
+    if (!continueButtonClicked) {
+      console.log('Could not find continue button with predefined selectors, trying to find any form to submit...');
+      
+      // Try to submit the form as a fallback
+      try {
+        await page.evaluate(() => {
+          const form = document.querySelector('form');
+          if (form) {
+            form.submit();
+            return true;
+          }
+          return false;
+        });
+        console.log('Submitted form as fallback');
+        continueButtonClicked = true;
+      } catch (error) {
+        console.log(`Error with form submission fallback: ${error.message}`);
+      }
+    }
+    
+    // Wait for navigation after clicking continue
+    await page.waitForTimeout(5000);
+    
+    // Take a screenshot after clicking continue
+    await saveScreenshot(page, 'after-continue-button', 'After clicking continue button');
+    
+    // Now look for password field
+    console.log('Looking for password field...');
+    const passwordSelectors = [
+      'input[type="password"]',
+      'input[name="session_password"]',
+      'input[aria-label="Password"]',
+      'input[placeholder="Password"]',
+      'input#password',
+      'input[autocomplete="current-password"]'
+    ];
+    
+    let passwordEntered = false;
+    
+    // Wait longer for the password field to appear
+    console.log('Waiting for password field to appear...');
+    await page.waitForTimeout(5000);
+    await saveScreenshot(page, 'before-password-attempt', 'Before password attempt');
+    
+    // First try the direct approach with each selector
+    for (const selector of passwordSelectors) {
+      try {
+        const passwordField = await page.$(selector);
+        if (passwordField) {
+          console.log(`Found password field with selector: ${selector}`);
+          
+          // Focus on the field first (like a human would)
+          console.log('Focusing on password field...');
+          await page.focus(selector);
+          await page.waitForTimeout(800 + Math.random() * 500); // Random human-like pause
+          
+          // Click the field (humans click after focusing)
+          await page.click(selector);
+          await page.waitForTimeout(500 + Math.random() * 300);
+          
+          // Clear any existing text with triple-click and backspace (human behavior)
+          await page.click(selector, { clickCount: 3 }); // Triple click to select all text
+          await page.waitForTimeout(300 + Math.random() * 200);
+          await page.keyboard.press('Backspace'); // Delete selected text
+          await page.waitForTimeout(500 + Math.random() * 300);
+          
+          // Type the password character by character with variable delays (like human typing)
+          console.log('Typing password character by character with human-like timing...');
+          for (let i = 0; i < password.length; i++) {
+            // Humans don't type at consistent speeds
+            const typingDelay = 100 + Math.random() * 150;
+            await page.keyboard.type(password[i]);
+            await page.waitForTimeout(typingDelay);
+          }
+          
+          console.log('Finished typing password');
+          // Pause briefly after typing (humans pause before clicking submit)
+          await page.waitForTimeout(800 + Math.random() * 700);
+          
+          // Verify the password was entered
+          const passwordValue = await page.evaluate((sel) => {
+            const input = document.querySelector(sel);
+            return input ? input.value : '';
+          }, selector);
+          
+          // Check if password field has a value (might be masked)
+          if (passwordValue.length > 0 || passwordValue === '••••••••') {
+            console.log('Password field has a value');
+            passwordEntered = true;
+            break;
+          } else {
+            console.log('Password field appears empty after typing, trying alternative method...');
+            
+            // Try direct value setting as fallback
+            await page.evaluate((sel, pwd) => {
+              const input = document.querySelector(sel);
+              if (input) {
+                input.value = pwd;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            }, selector, password);
+            
+            await page.waitForTimeout(1000);
+            passwordEntered = true;
+            break;
+          }
+        }
+      } catch (error) {
+        console.log(`Error with password selector ${selector}: ${error.message}`);
+      }
+    }
+    
+    // If direct approach failed, try JavaScript execution method
+    if (!passwordEntered) {
+      console.log('Direct approach failed. Trying JavaScript execution method...');
+      try {
+        const passwordFieldExists = await page.evaluate(() => {
+          // Find any password field
+          const passwordInput = document.querySelector('input[type="password"]');
+          if (passwordInput) {
+            // Make sure it's visible
+            return passwordInput.offsetParent !== null;
+          }
+          return false;
+        });
+        
+        if (passwordFieldExists) {
+          console.log('Found password field via JavaScript. Setting value...');
+          
+          await page.evaluate((pwd) => {
+            const passwordInput = document.querySelector('input[type="password"]');
+            passwordInput.value = pwd;
+            passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
+            passwordInput.dispatchEvent(new Event('change', { bubbles: true }));
+          }, password);
+          
+          console.log('Set password via JavaScript');
+          passwordEntered = true;
+        }
+      } catch (error) {
+        console.log(`Error with JavaScript password entry: ${error.message}`);
+      }
+    }
+    
+    // Take a screenshot after entering password
+    await saveScreenshot(page, 'after-password-entry', 'After password entry');
+    
+    if (!passwordEntered) {
+      console.log('Failed to enter password');
+      return false;
+    }
+    
+    // Look for and click the sign in button
+    console.log('Looking for sign in button...');
+    const signInButtonSelectors = [
+      'button:has-text("Sign in")',
+      'button:has-text("Log in")',
+      'button:has-text("Login")',
+      'button[type="submit"]'
+    ];
+    
+    let signInButtonClicked = false;
+    
+    for (const selector of signInButtonSelectors) {
+      try {
+        const buttonExists = await page.$(selector);
+        if (buttonExists) {
+          console.log(`Found sign in button with selector: ${selector}`);
+          await page.click(selector);
+          console.log('Clicked sign in button');
+          signInButtonClicked = true;
+          break;
+        }
+      } catch (error) {
+        console.log(`Error with sign in button selector ${selector}: ${error.message}`);
+      }
+    }
+    
+    if (!signInButtonClicked) {
+      console.log('Could not find sign in button with predefined selectors, trying to find any form to submit...');
+      
+      // Try to submit the form as a fallback
+      try {
+        await page.evaluate(() => {
+          const form = document.querySelector('form');
+          if (form) {
+            form.submit();
+            return true;
+          }
+          return false;
+        });
+        console.log('Submitted form as fallback for sign in');
+        signInButtonClicked = true;
+      } catch (error) {
+        console.log(`Error with form submission fallback for sign in: ${error.message}`);
+      }
+    }
+    
+    // Take a screenshot after clicking sign in
+    await saveScreenshot(page, 'after-signin-button', 'After clicking sign in button');
+    
+    const loginSuccess = passwordEntered && signInButtonClicked;
     
     console.log(`Direct login script ${loginSuccess ? 'succeeded' : 'failed'}`);
     
@@ -1387,6 +1555,190 @@ async function main() {
       console.log('Successfully verified login on feed page.');
     }
     
+    // Verify login is fully complete before proceeding
+    console.log('Verifying login is fully complete before navigating to search URL...');
+    
+    // First check if we're on a login page or checkpoint page
+    let currentUrl = page.url();
+    console.log(`Current URL during verification: ${currentUrl}`);
+    
+    // Take a screenshot to see current state
+    await saveScreenshot(page, 'login-verification-check', 'Login verification check');
+    
+    let loginVerified = false;
+    let retryCount = 0;
+    const maxRetries = 3;
+    
+    while (!loginVerified && retryCount < maxRetries) {
+      // Check if we're on a login-related page
+      if (currentUrl.includes('/login') || currentUrl.includes('/checkpoint') || currentUrl.includes('/uas/')) {
+        console.log(`Still on login-related page: ${currentUrl}`);
+        
+        // Check if there's a password field visible
+        const passwordFieldVisible = await page.evaluate(() => {
+          const passwordField = document.querySelector('input[type="password"]');
+          return passwordField && passwordField.offsetParent !== null;
+        });
+        
+        if (passwordFieldVisible) {
+          console.log('Password field is still visible. Attempting to enter password again...');
+          
+          // Try to enter password directly with multiple methods
+          try {
+            // Method 1: Clear and type directly
+            await page.click('input[type="password"]', { clickCount: 3 });
+            await page.keyboard.press('Backspace');
+            await page.waitForTimeout(1000);
+            
+            // Type password character by character with delay
+            console.log('Typing password character by character...');
+            for (let i = 0; i < password.length; i++) {
+              await page.keyboard.type(password[i]);
+              await page.waitForTimeout(100);
+            }
+            
+            console.log('Finished typing password');
+            await page.waitForTimeout(1000);
+            
+            // Method 2: Also try JavaScript method as backup
+            await page.evaluate((pwd) => {
+              const inputs = document.querySelectorAll('input[type="password"]');
+              inputs.forEach(input => {
+                input.value = pwd;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+              });
+            }, password);
+            
+            console.log('Also set password via JavaScript');
+            await page.waitForTimeout(1000);
+            
+            // Look for sign-in button with multiple approaches
+            const signInButtonSelectors = [
+              'button:has-text("Sign in")',
+              'button:has-text("Log in")',
+              'button[type="submit"]',
+              'button.sign-in-form__submit-button',
+              'button[aria-label="Sign in"]',
+              'button.btn__primary--large'
+            ];
+            
+            let buttonClicked = false;
+            
+            for (const selector of signInButtonSelectors) {
+              try {
+                // First check if button exists and is visible
+                const buttonVisible = await page.evaluate((sel) => {
+                  const button = document.querySelector(sel);
+                  return button && button.offsetParent !== null;
+                }, selector);
+                
+                if (buttonVisible) {
+                  console.log(`Found sign in button with selector: ${selector}`);
+                  
+                  // Get button position for human-like interaction
+                  const buttonPosition = await page.evaluate((sel) => {
+                    const button = document.querySelector(sel);
+                    const rect = button.getBoundingClientRect();
+                    return {
+                      x: rect.left + rect.width / 2,
+                      y: rect.top + rect.height / 2
+                    };
+                  }, selector);
+                  
+                  // Move mouse to button (human behavior)
+                  console.log('Moving mouse to button...');
+                  await page.mouse.move(
+                    buttonPosition.x + (Math.random() * 10 - 5), // Slightly random position
+                    buttonPosition.y + (Math.random() * 10 - 5),
+                    { steps: 10 } // Move in steps like a human
+                  );
+                  await page.waitForTimeout(300 + Math.random() * 400); // Pause before clicking
+                  
+                  // Click the button
+                  await page.mouse.down();
+                  await page.waitForTimeout(100 + Math.random() * 100); // Human-like press duration
+                  await page.mouse.up();
+                  
+                  console.log('Clicked sign in button');
+                  buttonClicked = true;
+                  break;
+                }
+              } catch (error) {
+                console.log(`Error with button selector ${selector}: ${error.message}`);
+              }
+            }
+            
+            // If no button found, try pressing Enter
+            if (!buttonClicked) {
+              console.log('No button found, pressing Enter key');
+              await page.keyboard.press('Enter');
+            }
+            
+            // Wait for navigation
+            await page.waitForTimeout(15000);
+            await saveScreenshot(page, 'after-password-retry', 'After password retry');
+          } catch (error) {
+            console.log(`Error during password retry: ${error.message}`);
+          }
+        } else {
+          console.log('No password field visible, but still on login page. Waiting for completion...');
+          await page.waitForTimeout(15000);
+        }
+        
+        // Force navigation to feed page if still on login page
+        currentUrl = page.url();
+        if (currentUrl.includes('/login') || currentUrl.includes('/checkpoint') || currentUrl.includes('/uas/')) {
+          console.log(`Still on login-related page after retry: ${currentUrl}`);
+          await saveScreenshot(page, 'still-on-login-page', 'Still on login page after retry');
+          
+          console.log('Attempting to navigate to feed as a fallback...');
+          try {
+            await page.goto('https://www.linkedin.com/feed/', { 
+              waitUntil: 'networkidle2', 
+              timeout: 60000 
+            });
+            await page.waitForTimeout(10000);
+            await saveScreenshot(page, 'after-feed-redirect', 'After feed redirect');
+          } catch (error) {
+            console.log(`Error navigating to feed: ${error.message}`);
+          }
+        }
+      }
+      
+      // Check if we're logged in now
+      currentUrl = page.url();
+      console.log(`Current URL after retry ${retryCount + 1}: ${currentUrl}`);
+      
+      loginVerified = await page.evaluate(() => {
+        // Check for elements that definitively indicate we're logged in
+        const definiteLoginIndicators = [
+          document.querySelector('.global-nav__me'),
+          document.querySelector('img.global-nav__me-photo'),
+          document.querySelector('.feed-identity-module__actor-meta'),
+          document.querySelector('.profile-rail-card__actor-link'),
+          document.querySelector('[data-control-name="identity_welcome_message"]')
+        ];
+        
+        return definiteLoginIndicators.some(el => el !== null);
+      });
+      
+      if (loginVerified) {
+        console.log(`Login verified on attempt ${retryCount + 1}. Proceeding to search URL.`);
+        break;
+      } else {
+        console.log(`Login not verified on attempt ${retryCount + 1}. ${retryCount < maxRetries - 1 ? 'Retrying...' : 'Max retries reached.'}`);
+        await saveScreenshot(page, `login-verification-attempt-${retryCount + 1}`, `Login verification attempt ${retryCount + 1}`);
+        await page.waitForTimeout(10000);
+        retryCount++;
+      }
+    }
+    
+    // If we still can't verify login but we're not on a login page, proceed anyway
+    if (!loginVerified && !currentUrl.includes('/login') && !currentUrl.includes('/checkpoint') && !currentUrl.includes('/uas/')) {
+      console.log('Could not definitively verify login, but not on login page. Proceeding with caution.');
+    }
+    
     // Now try to navigate directly to the search URL
     console.log('Navigating to search URL...');
     
@@ -1409,38 +1761,49 @@ async function main() {
     // Take a screenshot before navigation
     await saveScreenshot(page, 'before-search-navigation', 'Before search navigation');
     
-    // Direct navigation to search URL - simplest approach
+    // Direct navigation to search URL - simplest approach as per user preference
     console.log(`Directly navigating to search URL: ${searchUrl}`);
-    let currentUrl = '';
+    // Reset currentUrl for navigation phase
+    currentUrl = '';
     
     try {
+      // Use networkidle2 for more reliable page loading
+      console.log(`Navigating to: ${searchUrl}`);
       await page.goto(searchUrl, { 
-        waitUntil: 'domcontentloaded', 
+        waitUntil: 'networkidle2', 
         timeout: 60000 
       });
       
-      // Wait for page to load
-      await page.waitForTimeout(5000);
+      // Wait for page to stabilize
+      console.log('Waiting for search page to stabilize...');
+      await page.waitForTimeout(10000);
       currentUrl = page.url();
       console.log(`Current URL after navigation: ${currentUrl}`);
       
     } catch (error) {
       console.error(`Error navigating to search URL: ${error.message}`);
+      await saveScreenshot(page, 'search-navigation-error', 'Search navigation error');
       
       // Fallback: try a simplified search URL
       console.log('Trying fallback search URL...');
       try {
+        // Use a basic search URL as fallback
         const fallbackUrl = 'https://www.linkedin.com/search/results/people/?keywords=tech';
+        console.log(`Trying fallback URL: ${fallbackUrl}`);
+        
         await page.goto(fallbackUrl, { 
-          waitUntil: 'domcontentloaded', 
-          timeout: 30000 
+          waitUntil: 'networkidle2', 
+          timeout: 60000 
         });
         
-        await page.waitForTimeout(5000);
+        console.log('Waiting for fallback page to stabilize...');
+        await page.waitForTimeout(10000);
         currentUrl = page.url();
         console.log(`Current URL after fallback navigation: ${currentUrl}`);
+        
       } catch (fallbackError) {
         console.error(`Error with fallback navigation: ${fallbackError.message}`);
+        await saveScreenshot(page, 'fallback-navigation-error', 'Fallback navigation error');
         currentUrl = page.url();
       }
     }
