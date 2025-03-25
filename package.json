@@ -1,0 +1,23 @@
+{
+  "name": "linkedin-networking-bot-throttled",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A throttled LinkedIn bot to send one connection and one message per hour",
+  "main": "src/linkedin-bot.mjs",
+  "scripts": {
+    "start": "node src/linkedin-bot.mjs"
+  },
+  "dependencies": {
+    "dayjs": "^1.11.9",
+    "dotenv": "^16.4.7",
+    "puppeteer": "^21.0.0"
+  },
+  "pnpm": {
+    "ignoredBuiltDependencies": [
+      "puppeteer"
+    ],
+    "onlyBuiltDependencies": [
+      "puppeteer"
+    ]
+  }
+}
