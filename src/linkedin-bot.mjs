@@ -186,6 +186,7 @@ async function launchBrowser() {
   console.log('Launching browser');
   const browser = await puppeteer.launch({ 
     headless: true,
+    executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     args: [
       '--window-size=1280,800',
       '--disable-web-security',
@@ -680,6 +681,14 @@ async function sendOneFollowUpMessage(page) {
 async function checkForSmsVerification(page) {
   try {
     console.log('Starting SMS verification process...');
+
+    // click on #try-another-way
+    const tryAnotherWay = await page.waitForSelector('#try-another-way', { timeout: 15000 })
+
+    await tryAnotherWay.click()
+
+    await page.waitForTimeout(5000)
+    
     // Wait for the SMS code input field
     const smsInput = await page.waitForSelector('input#input__phone_verification_pin', { timeout: 15000 });
     if (!smsInput) {
@@ -901,7 +910,7 @@ async function loginWithCredentials(page, username, password) {
 
     // Check if we've been redirected to a checkpoint/challenge page
     const currentUrl = page.url();
-    if (currentUrl.includes('/checkpoint/challenge/')) {
+    if (currentUrl.includes('/checkpoint')) {
       console.log('Detected checkpoint challenge. Initiating SMS verification...');
       await checkForSmsVerification(page);
       return false;
@@ -990,11 +999,11 @@ async function main() {
       const { username, password } = await promptForCredentials();
       isLoggedIn = await loginWithCredentials(page, username, password);
       
-      if (!isLoggedIn) {
-        console.log('Login failed. Exiting...');
-        await browser.close();
-        return;
-      }
+      // if (!isLoggedIn) {
+      //   console.log('Login failed. Exiting...');
+      //   // await browser.close();
+      //   return;
+      // }
       
       // Save cookies after successful login
       await saveCookies(page);
