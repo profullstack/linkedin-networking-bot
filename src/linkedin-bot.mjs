@@ -186,7 +186,7 @@ async function launchBrowser() {
   console.log('Launching browser');
   const browser = await puppeteer.launch({ 
     headless: true,
-    executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    //executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     args: [
       '--window-size=1280,800',
       '--disable-web-security',
