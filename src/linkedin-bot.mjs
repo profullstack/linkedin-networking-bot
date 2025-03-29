@@ -8,10 +8,8 @@ import readline from 'readline';
 import dotenv from 'dotenv';
 import { existsSync, mkdirSync } from 'fs';
 import { logger } from './logger.mjs';
-import { withRetry, setupPageErrorHandlers } from './error-handler.mjs';
 
-// Load environment variables from .env file
-dotenv.config();
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,6 +19,9 @@ const pendingFile = path.join(__dirname, '../pending.json');
 const messagedFile = path.join(__dirname, '../messaged.json');
 const cookiesFile = path.join(__dirname, '../cookies.json');
 const logsDir = path.join(__dirname, '../logs');
+
+// Load environment variables from .env file
+dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), '../.env') });
 
 // Ensure logs directory exists
 function ensureLogsDir() {
@@ -184,9 +185,12 @@ async function promptForCredentials() {
 
 async function launchBrowser() {
   console.log('Launching browser');
-  const browser = await puppeteer.launch({ 
-    headless: true,
-    //executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+
+  const execPath = process.env.EXEC_PATH || null;
+
+  const browser = await puppeteer.launch({
+    headless: false,
+    executablePath: execPath,
     args: [
       '--window-size=1280,800',
       '--disable-web-security',
@@ -260,7 +264,7 @@ async function launchBrowser() {
   page.setDefaultNavigationTimeout(90000);
   
   // Set default timeout for waitForSelector, etc.
-  page.setDefaultTimeout(60000);
+  page.setDefaultTimeout(80000);
   
   return { browser, page };
 }
@@ -274,24 +278,38 @@ async function saveCookies(page) {
     const validCookies = cookies.filter(cookie => {
       // Check if cookie has expired
       if (cookie.expires && cookie.expires < Date.now() / 1000) {
-        console.log(`Skipping expired cookie: ${cookie.name}`);
+        logger.info(`Skipping expired cookie: ${cookie.name}`);
         return false;
       }
       
       // Ensure essential properties exist
       if (!cookie.name || !cookie.value) {
-        console.log(`Skipping invalid cookie: ${JSON.stringify(cookie)}`);
+        logger.info(`Skipping invalid cookie: ${JSON.stringify(cookie)}`);
         return false;
       }
       
       // Keep only linkedin.com related cookies
       if (!cookie.domain.includes('linkedin.com')) {
-        console.log(`Skipping non-LinkedIn cookie: ${cookie.name}`);
+        logger.info(`Skipping non-LinkedIn cookie: ${cookie.name}`);
         return false;
       }
       
+      // Check for essential LinkedIn cookies
+      const essentialCookies = ['li_at', 'JSESSIONID'];
+      const hasEssentialCookies = essentialCookies.some(name => cookie.name === name);
+      
       return true;
     });
+    
+    // Verify we have essential cookies
+    const essentialCookies = ['li_at', 'JSESSIONID'];
+    const missingEssentials = essentialCookies.filter(name => 
+      !validCookies.some(cookie => cookie.name === name)
+    );
+    
+    if (missingEssentials.length > 0) {
+      throw new Error(`Missing essential cookies: ${missingEssentials.join(', ')}`);
+    }
     
     if (validCookies.length === 0) {
       throw new Error('No valid cookies found');
@@ -299,10 +317,10 @@ async function saveCookies(page) {
     
     // Save filtered cookies
     await saveJson(cookiesFile, validCookies);
-    console.log(`Saved ${validCookies.length} valid cookies`);
+    logger.info(`Saved ${validCookies.length} valid cookies`);
     return true;
   } catch (error) {
-    console.error(`Error saving cookies: ${error.message}`);
+    logger.error(`Error saving cookies: ${error.message}`);
     return false;
   }
 }
@@ -646,7 +664,7 @@ async function sendOneFollowUpMessage(page) {
   
   try {
     await page.goto('https://www.linkedin.com/mynetwork/invite-connect/connections/', { waitUntil: 'networkidle2' });
-    await page.waitForSelector('.mn-connection-card', { timeout: 30000 });
+    await page.waitForSelector('.mn-connection-card', { timeout: 80000 });
   } catch (error) {
     console.error(`Error accessing connections page: ${error.message}`);
     console.log('Taking screenshot of current page...');
@@ -726,66 +744,118 @@ async function checkIfLoggedIn(page) {
     // Check if we're on a LinkedIn page first
     const currentUrl = page.url();
     if (!currentUrl.includes('linkedin.com')) {
-      console.log('Not on LinkedIn domain');
+      logger.info('Not on LinkedIn domain');
       return false;
     }
 
     // Check for login-required pages and redirects
     const loginRelatedPaths = ['/login', '/checkpoint', '/authwall', '/uas/login'];
     if (loginRelatedPaths.some(path => currentUrl.includes(path))) {
-      console.log('On login-related page - not logged in');
+      logger.info('On login-related page - not logged in');
       return false;
     }
 
-    // Check if we were redirected from login page
-    const redirectHistory = await page.evaluate(() => {
-      return performance.getEntriesByType('navigation')[0]?.redirectCount > 0;
-    });
+    // Check cookies first
+    const cookies = await page.cookies();
+    const essentialCookies = ['li_at', 'JSESSIONID'];
+    const missingCookies = essentialCookies.filter(name => 
+      !cookies.some(cookie => cookie.name === name)
+    );
+
+    if (missingCookies.length > 0) {
+      logger.info(`Missing essential cookies: ${missingCookies.join(', ')}`);
+      return false;
+    }
 
     // Most reliable indicator is the global nav
     const globalNav = await page.$('.global-nav__primary-item');
     if (globalNav) {
-      console.log('Found global nav primary item - logged in');
+      logger.info('Found global nav primary item - logged in');
       return true;
     }
 
     // Check for feed content as backup
     const feedContent = await page.$('div.scaffold-finite-scroll__content[data-finite-scroll-hotkey-context="FEED"]');
     if (feedContent) {
-      console.log('Found feed content with FEED context - logged in');
+      logger.info('Found feed content with FEED context - logged in');
       return true;
     }
 
     // Check for profile menu button which is present for logged-in users
     const profileMenu = await page.$('button.global-nav__primary-link.global-nav__primary-link-me-menu-trigger.artdeco-dropdown__trigger');
     if (profileMenu) {
-      console.log('Found profile menu - logged in');
+      logger.info('Found profile menu - logged in');
       return true;
     }
 
     // If we can't find logged-in elements, check for login button
     const loginButton = await page.$('a[href*="/login"]');
     if (loginButton) {
-      console.log('Found login button - not logged in');
+      logger.info('Found login button - not logged in');
       return false;
     }
 
-    // If we were redirected and can't find login elements, likely logged in
-    if (redirectHistory) {
-      console.log('Detected redirect from login page - likely logged in');
-      return true;
+    // Try to access a protected page
+    try {
+      await page.goto('https://www.linkedin.com/feed/', {
+        waitUntil: 'networkidle2',
+        timeout: 80000
+      });
+      const feedPage = await page.$('div[data-test-id="feed-container"]');
+      if (feedPage) {
+        logger.info('Successfully accessed feed page - logged in');
+        return true;
+      }
+    } catch (error) {
+      logger.error(`Error accessing feed page: ${error.message}`);
     }
 
-    console.log('Login status unclear - assuming not logged in');
+    logger.info('Login status unclear - assuming not logged in');
     return false;
   } catch (error) {
-    console.error(`Error checking login status: ${error.message}`);
+    logger.error(`Error checking login status: ${error.message}`);
     return false;
   }
 }
 
 async function loginWithCredentials(page, username, password) {
   try {
+    // Navigate to LinkedIn login page
+    await page.goto('https://www.linkedin.com/login', {
+      waitUntil: 'networkidle2',
+      timeout: 80000
+    });
+
+    // Check for "Welcome back" single-field login
+    const welcomeBackText = await page.$eval('h1, .header__content', el => el.textContent.toLowerCase().trim())
+      .catch(() => '');
+    const isSingleFieldLogin = welcomeBackText.includes('welcome back');
+
+    if (isSingleFieldLogin) {
+      console.log('Detected "Welcome back" single-field login...');
+      // Only password field should be present
+      await page.waitForSelector('#password', { timeout: 80000 });
+      // Type password with random delays
+      await page.type('#password', password, { delay: Math.floor(Math.random() * 100) + 50 });
+    } else {
+      // Standard login form with both username and password fields
+      console.log('Standard login form detected...');
+
+    // Wait for login form
+    await page.waitForSelector('#username', { timeout: 80000 });
+    await page.waitForSelector('#password', { timeout: 80000 });
+
+    // Type credentials with random delays
+    await page.type('#username', username, { delay: Math.floor(Math.random() * 100) + 50 });
+    await page.type('#password', password, { delay: Math.floor(Math.random() * 100) + 50 });
+    }
+
+    // Click sign in and wait for navigation
+    await Promise.all([
+      page.click('button[type="submit"]'),
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 80000 })
+    ]);
+
     // Configure browser stealth settings
     await page.evaluateOnNewDocument(() => {
       // Overwrite navigator properties
@@ -846,7 +916,7 @@ async function loginWithCredentials(page, username, password) {
     console.log('Navigating to LinkedIn login page...');
     await page.goto('https://www.linkedin.com/login', {
       waitUntil: 'domcontentloaded',
-      timeout: 30000 
+      timeout: 80000 
     });
     
     // Simulate human typing behavior for username
@@ -911,6 +981,16 @@ async function loginWithCredentials(page, username, password) {
     // Check if we've been redirected to a checkpoint/challenge page
     const currentUrl = page.url();
     if (currentUrl.includes('/checkpoint')) {
+      // Check for puzzle captcha text
+      const pageContent = await page.content();
+      const hasPuzzleCaptcha = pageContent.includes("Let's do a quick security check");
+      
+      if (hasPuzzleCaptcha) {
+        console.log('Detected puzzle captcha challenge. Please solve the puzzle manually.');
+        await saveScreenshot(page, 'puzzle-captcha', 'Puzzle captcha challenge screenshot');
+        return false;
+      }
+      
       console.log('Detected checkpoint challenge. Initiating SMS verification...');
       await checkForSmsVerification(page);
       return false;
@@ -984,9 +1064,9 @@ async function main() {
     // Navigate to LinkedIn and check if already logged in
     console.log('Navigating to LinkedIn...');
     // Use a more reliable waitUntil condition and shorter timeout
-    await page.goto('https://www.linkedin.com', { 
+    await page.goto('https://www.linkedin.com', {
       waitUntil: 'domcontentloaded', 
-      timeout: 30000 
+      timeout: 80000 
     }).catch(error => {
       console.log(`Initial navigation error (non-fatal): ${error.message}`);
     });
@@ -1041,23 +1121,57 @@ async function main() {
     console.log(`Directly navigating to search URL: ${searchUrl}`);
     // Reset currentUrl for navigation phase
     let currentUrl = '';
+    let retryCount = 0;
+    const maxRetries = 3;
     
-    try {
-      // Use networkidle2 for more reliable page loading
-      console.log(`Navigating to: ${searchUrl}`);
-      //await page.goto(searchUrl);
+    while (retryCount < maxRetries) {
+      try {
+        console.log(`Navigating to search URL (attempt ${retryCount + 1}): ${searchUrl}`);
+        
+        // Create a new page for each attempt
+        const newPage = await browser.newPage();
+        
+        // Set longer timeout and wait for network idle
+        await newPage.goto(searchUrl, {
+          waitUntil: ['domcontentloaded', 'networkidle0'],
+          timeout: 60000
+        });
 
-      // Open a new tab and navigate to the link
-      const newPage = await browser.newPage();
-      await newPage.goto(searchUrl, { waitUntil: 'networkidle2' });
+        // Wait for page to stabilize
+        await newPage.waitForTimeout(5000);
+        
+        // Check if the page loaded successfully
+        const pageContent = await newPage.content();
+        const hasError = pageContent.includes('page not found') || 
+                        pageContent.includes('something went wrong') ||
+                        pageContent.includes('error');
+                        
+        if (!hasError) {
+          // Close the original page and use the new one
+          await page.close();
+          page = newPage;
+          
+          currentUrl = page.url();
+          console.log(`Successfully loaded search page: ${currentUrl}`);
+          return; // Success - exit the retry loop
+        }
+        
+        console.log('Page loaded with errors, retrying...');
+        await saveScreenshot(newPage, `search-error-attempt-${retryCount + 1}`, 'Search page error');
+        await newPage.close();
+        
+      } catch (error) {
+        console.error(`Error on attempt ${retryCount + 1}: ${error.message}`);
+        await saveScreenshot(page, `search-navigation-error-${retryCount + 1}`, 'Navigation error');
+      }
       
-      currentUrl = newPage.url();
-      console.log(`Current URL after navigation: ${currentUrl}`);
-      
-    } catch (error) {
-      console.error(`Error navigating to search URL: ${error.message}`);
-      await saveScreenshot(page, 'search-navigation-error', 'Search navigation error');
+      retryCount++;
+      if (retryCount < maxRetries) {
+        console.log(`Waiting before retry attempt ${retryCount + 1}...`);
+        await wait(10000); // Wait longer between retries
+      }
     }
+
     
     // Take a screenshot after navigation
     await saveScreenshot(page, 'after-search-navigation', 'After search navigation');
@@ -1069,17 +1183,21 @@ async function main() {
     const maxConnectionRequests = 5;
     let connectionsSent = 0;
     
-    while (connectionsSent < maxConnectionRequests) {
-      console.log(`Sending connection request ${connectionsSent + 1} of ${maxConnectionRequests}...`);
-      // Use a modified version of sendOneConnectionRequest that skips navigation
-      const sent = await sendOneConnectionRequest(newPage);
+    for (let i = 0; i < maxConnectionRequests; i++) {
+      console.log(`Attempting to send connection request ${i + 1} of ${maxConnectionRequests}...`);
+      const sent = await sendOneConnectionRequest(page);
       
       if (sent) {
         connectionsSent++;
-        console.log(`Connection request ${connectionsSent} sent. Waiting before next request...`);
-        await page.waitForTimeout(5000 + Math.random() * 5000); // Random wait between 5-10 seconds
+        console.log(`Connection request ${connectionsSent} sent successfully.`);
+        // Add a random delay between successful requests to appear more natural
+        if (i < maxConnectionRequests - 1) {
+          const delay = 5000 + Math.random() * 5000; // Random wait between 5-10 seconds
+          console.log(`Waiting ${Math.round(delay/1000)} seconds before next request...`);
+          await page.waitForTimeout(delay);
+        }
       } else {
-        console.log('Failed to send connection request. Trying again...');
+        console.log('Failed to send connection request. Moving to next profile...');
         await page.waitForTimeout(3000);
       }
     }
