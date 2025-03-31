@@ -964,7 +964,7 @@ async function loginWithCredentials(page, username, password) {
     }
 
     // Wait for navigation to complete
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded' });
+    await page.waitForNavigation({ waitUntil: 'networkidle2' });
 
     // Take screenshot after sign in
     await saveScreenshot(page, 'after-signin', 'After sign in');
@@ -983,16 +983,111 @@ async function loginWithCredentials(page, username, password) {
     if (currentUrl.includes('/checkpoint')) {
       // Check for puzzle captcha text
       const pageContent = await page.content();
-      const hasPuzzleCaptcha = pageContent.includes("Let's do a quick security check");
-      
-      if (hasPuzzleCaptcha) {
-        console.log('Detected puzzle captcha challenge. Please solve the puzzle manually.');
+      const hasPuzzleCaptcha = pageContent.includes("security check");
+
+      // check for puzzle security challenge (captcha)
+      const hasPuzzleSecurityChallenge = await page.$('.challenge-card');
+
+      // Check for text indicating a security challenge
+      const hasSecurityText = pageContent.toLowerCase().includes('security check');
+
+      // Check for captcha iframe
+      const hasCaptchaIframe = await page.$('iframe[src*="captcha"]');
+
+      // Check for reCAPTCHA elements
+      const hasReCaptcha = await page.$('div.g-recaptcha') || await page.$('iframe[src*="recaptcha"]');
+
+      if (hasPuzzleSecurityChallenge || hasSecurityText || hasCaptchaIframe || hasReCaptcha) {
+        console.log('Detected puzzle captcha challenge.');
+        await saveScreenshot(page, 'security-challenge', 'Security challenge or captcha detected');
+
+        await page.waitForTimeout(60000)
+
+        console.log('Clicking verify button')
+
+        const clickVerifyButton = await page.$('#home_children_button')
+        clickVerifyButton.click()
+
+        await page.waitForTimeout(60000)
+
+        // detect challenge game
+        const detectChallengeGame = await page.$('#EnforcementChallenge')
+
+        if(!detectChallengeGame) {
+          console.log('Game challenge not found')
+        } else {
+          console.log('Game challenge found')
+        }
+
+        await page.waitForTimeout(60000)
+        
+        const screenshot = await detectChallengeGame.screenshot({
+          encoding: 'base64'
+        });
+        
+        // If AI solving is enabled, try to solve with OpenAI Vision
+        if (process.env.USE_AI === 'true' && process.env.OPENAI_API_KEY) {
+          try {
+            const { initOpenAI, analyzePuzzleCaptcha } = await import('./openai-vision.mjs');
+            initOpenAI(process.env.OPENAI_API_KEY);
+            
+            console.log('Analyzing puzzle with AI...');
+            const solution = await analyzePuzzleCaptcha(screenshot);
+            console.log('AI Analysis:', solution);
+            
+            // Parse the AI solution
+            const parsedSolution = JSON.parse(solution);
+            
+            // Get puzzle element dimensions and position
+            const puzzleBounds = await puzzleElement.boundingBox();
+            
+            // Calculate absolute coordinates based on puzzle element position
+            const clickX = puzzleBounds.x + parsedSolution.click_coordinates.x;
+            const clickY = puzzleBounds.y + parsedSolution.click_coordinates.y;
+            
+            // Move mouse to coordinates with human-like motion
+            await page.mouse.move(clickX, clickY, {
+              steps: 25 // More steps = smoother motion
+            });
+            
+            // Add small random delay before clicking
+            await page.waitForTimeout(Math.random() * 500 + 200);
+            
+            // Click to rotate puzzle
+            await page.mouse.click(clickX, clickY);
+            
+            // Wait for rotation animation
+            await page.waitForTimeout(1000);
+            
+            // Save screenshot for verification
+            await saveScreenshot(page, 'puzzle-captcha-solved', 'Puzzle captcha after rotation');
+            
+            // Wait for navigation after solving
+            await page.waitForNavigation({ timeout: 10000 }).catch(() => {});
+            return true;
+          } catch (error) {
+            console.error('Error using AI for puzzle analysis:', error);
+          }
+        }
+        
+        console.log('Please solve the puzzle manually.');
         await saveScreenshot(page, 'puzzle-captcha', 'Puzzle captcha challenge screenshot');
         return false;
       }
       
-      console.log('Detected checkpoint challenge. Initiating SMS verification...');
-      await checkForSmsVerification(page);
+      // Check if SMS verification is needed by looking for 'Enter the code' text
+      const hasEnterCodeText = await page.evaluate(() => {
+        return document.body.innerText.includes('Enter the code');
+      });
+      
+      if (hasEnterCodeText) {
+        console.log('Detected SMS verification challenge. Initiating SMS verification...');
+        await checkForSmsVerification(page);
+      } else {
+        console.log('SMS verification challenge not detected.');
+      }
+
+
       return false;
     } else {
       console.log('No checkpoint challenge detected. Continuing with normal flow...');
@@ -1023,225 +1118,92 @@ async function main() {
   console.log('Checking for duplicate profiles...');
   await deduplicateProfiles(pendingFile);
   await deduplicateProfiles(messagedFile);
-  
+
   const { browser, page } = await launchBrowser();
-  
+
   try {
-    // Try to load cookies with improved filtering
+    // Ensure login is completed before proceeding
+    console.log('Starting login process...');
+    let isLoggedIn = false;
+
     try {
       const cookies = await loadJson(cookiesFile);
       if (cookies.length > 0) {
         console.log(`Found ${cookies.length} saved cookies...`);
-        
-        // Filter out potentially problematic cookies
-        const filteredCookies = cookies.filter(cookie => {
-          // Remove cookies with very short expiration or session cookies
-          const hasValidExpiration = cookie.expires && (cookie.expires > Date.now() / 1000);
-          
-          // Keep essential auth cookies and remove tracking/analytics cookies
-          const isEssentialCookie = cookie.name.includes('li_at') || 
-                                   cookie.name.includes('JSESSIONID') || 
-                                   cookie.name.includes('lidc') || 
-                                   cookie.name.includes('bcookie') || 
-                                   cookie.name.includes('bscookie');
-          
-          return hasValidExpiration && isEssentialCookie;
-        });
-        
-        console.log(`Filtered cookies: ${filteredCookies.length} of ${cookies.length} cookies kept`);
-        
-        if (filteredCookies.length > 0) {
-          await page.setCookie(...filteredCookies);
-          console.log('Essential cookies loaded successfully');
-        } else {
-          console.log('No essential cookies found after filtering');
-        }
+        await page.setCookie(...cookies);
+        console.log('Cookies loaded successfully.');
       }
     } catch (error) {
       console.log(`Error loading cookies: ${error.message}`);
     }
-    
-    // Navigate to LinkedIn and check if already logged in
-    console.log('Navigating to LinkedIn...');
-    // Use a more reliable waitUntil condition and shorter timeout
-    await page.goto('https://www.linkedin.com', {
-      waitUntil: 'domcontentloaded', 
-      timeout: 80000 
-    }).catch(error => {
-      console.log(`Initial navigation error (non-fatal): ${error.message}`);
-    });
-    
-    let isLoggedIn = await checkIfLoggedIn(page);
-    
-    // If not logged in, prompt for credentials
+
+    // Navigate to LinkedIn and check login status
+    await page.goto('https://www.linkedin.com', { waitUntil: 'domcontentloaded', timeout: 80000 });
+    isLoggedIn = await checkIfLoggedIn(page);
+
     if (!isLoggedIn) {
       console.log('Not logged in. Prompting for credentials...');
       const { username, password } = await promptForCredentials();
       isLoggedIn = await loginWithCredentials(page, username, password);
-      
-      // if (!isLoggedIn) {
-      //   console.log('Login failed. Exiting...');
-      //   // await browser.close();
-      //   return;
-      // }
-      
+
+      if (!isLoggedIn) {
+        console.log('Login failed. Exiting...');
+        return;
+      }
+
       // Save cookies after successful login
       await saveCookies(page);
     }
 
+    console.log('Login successful. Proceeding with other processes...');
+
     // Wait for the feed page to load
     await page.waitForTimeout(5000);
-    
-    // Take a screenshot to see where we are
+
+    // Take a screenshot to confirm login
     await saveScreenshot(page, 'linkedin-feed', 'LinkedIn feed page');
 
-    // Now try to navigate directly to the search URL
+    // Now proceed with search and sending connection requests
     console.log('Navigating to search URL...');
-    
-    // Validate and ensure the search URL is properly formatted
     let searchUrl = config.search_url;
     if (!searchUrl.startsWith('http')) {
-      console.log('Search URL does not have proper scheme, adding https://');
-      // Remove leading slashes if present
-      if (searchUrl.startsWith('//')) {
-        searchUrl = searchUrl.substring(2);
-      }
-      searchUrl = 'https://' + searchUrl;
+      searchUrl = 'https://' + searchUrl.replace(/^\/\//, '');
     }
-    console.log(`Using validated search URL: ${searchUrl}`);
-    
-    // Wait 10 seconds after login as requested by the user
-    console.log('Waiting 10 seconds after login before navigating to search URL...');
-    await page.waitForTimeout(10000);
-    
-    // Take a screenshot before navigation
-    await saveScreenshot(page, 'before-search-navigation', 'Before search navigation');
-    
-    // Direct navigation to search URL - simplest approach as per user preference
-    console.log(`Directly navigating to search URL: ${searchUrl}`);
-    // Reset currentUrl for navigation phase
-    let currentUrl = '';
-    let retryCount = 0;
-    const maxRetries = 3;
-    
-    while (retryCount < maxRetries) {
-      try {
-        console.log(`Navigating to search URL (attempt ${retryCount + 1}): ${searchUrl}`);
-        
-        // Create a new page for each attempt
-        const newPage = await browser.newPage();
-        
-        // Set longer timeout and wait for network idle
-        await newPage.goto(searchUrl, {
-          waitUntil: ['domcontentloaded', 'networkidle0'],
-          timeout: 60000
-        });
+    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 80000 });
 
-        // Wait for page to stabilize
-        await newPage.waitForTimeout(5000);
-        
-        // Check if the page loaded successfully
-        const pageContent = await newPage.content();
-        const hasError = pageContent.includes('page not found') || 
-                        pageContent.includes('something went wrong') ||
-                        pageContent.includes('error');
-                        
-        if (!hasError) {
-          // Close the original page and use the new one
-          await page.close();
-          page = newPage;
-          
-          currentUrl = page.url();
-          console.log(`Successfully loaded search page: ${currentUrl}`);
-          return; // Success - exit the retry loop
-        }
-        
-        console.log('Page loaded with errors, retrying...');
-        await saveScreenshot(newPage, `search-error-attempt-${retryCount + 1}`, 'Search page error');
-        await newPage.close();
-        
-      } catch (error) {
-        console.error(`Error on attempt ${retryCount + 1}: ${error.message}`);
-        await saveScreenshot(page, `search-navigation-error-${retryCount + 1}`, 'Navigation error');
-      }
-      
-      retryCount++;
-      if (retryCount < maxRetries) {
-        console.log(`Waiting before retry attempt ${retryCount + 1}...`);
-        await wait(10000); // Wait longer between retries
-      }
-    }
-
-    
-    // Take a screenshot after navigation
-    await saveScreenshot(page, 'after-search-navigation', 'After search navigation');
-
-    page.waitForTimeout(10000);
-
-    // Send connection requests
     console.log('Starting to send connection requests...');
     const maxConnectionRequests = 5;
-    let connectionsSent = 0;
-    
     for (let i = 0; i < maxConnectionRequests; i++) {
-      console.log(`Attempting to send connection request ${i + 1} of ${maxConnectionRequests}...`);
       const sent = await sendOneConnectionRequest(page);
-      
       if (sent) {
-        connectionsSent++;
-        console.log(`Connection request ${connectionsSent} sent successfully.`);
-        // Add a random delay between successful requests to appear more natural
-        if (i < maxConnectionRequests - 1) {
-          const delay = 5000 + Math.random() * 5000; // Random wait between 5-10 seconds
-          console.log(`Waiting ${Math.round(delay/1000)} seconds before next request...`);
-          await page.waitForTimeout(delay);
-        }
-      } else {
-        console.log('Failed to send connection request. Moving to next profile...');
-        await page.waitForTimeout(3000);
+        await page.waitForTimeout(5000 + Math.random() * 5000);
       }
     }
-    
-    // Send follow-up messages
+
     console.log('Starting to send follow-up messages...');
     const maxFollowUpMessages = 3;
-    let messagesSent = 0;
-    
-    while (messagesSent < maxFollowUpMessages) {
-      console.log(`Sending follow-up message ${messagesSent + 1} of ${maxFollowUpMessages}...`);
+    for (let i = 0; i < maxFollowUpMessages; i++) {
       await sendOneFollowUpMessage(page);
-      messagesSent++;
-      await page.waitForTimeout(5000 + Math.random() * 5000); // Random wait between 5-10 seconds
+      await page.waitForTimeout(5000 + Math.random() * 5000);
     }
-    
+
     console.log('All tasks completed successfully!');
   } catch (error) {
-    console.error('Error in main process:');
-    console.error(error);
-    
-    // Take a screenshot for debugging
-    try {
-      await saveScreenshot(page, 'error-screenshot', 'error');
-    } catch (screenshotError) {
-      console.error('Failed to take error screenshot:', screenshotError.message);
-    }
+    console.error('Error in main process:', error);
+    await saveScreenshot(page, 'error-screenshot', 'error');
   } finally {
-    // Save cookies before closing browser
     try {
       await saveCookies(page);
-      console.log('Final session cookies saved');
+      console.log('Final session cookies saved.');
     } catch (error) {
       console.error('Error saving cookies:', error.message);
     }
-    
-    // Close the browser
-    await browser.close();
-    console.log('Browser closed');
+    //await browser.close();
+    console.log('Browser closed.');
   }
 }
 
 main().catch(err => {
-  console.error('Fatal error in main process:');
-  console.error(err);
+  console.error('Fatal error in main process:', err);
   process.exit(1);
 });
