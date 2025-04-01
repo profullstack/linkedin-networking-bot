@@ -10,6 +10,7 @@ import { existsSync, mkdirSync } from 'fs';
 import { logger } from './logger.mjs';
 import { rateLimiter } from './rate-limiter.mjs';
 import { analyzeCaptchaBox, analyzePuzzleCaptcha, initOpenAI } from './openai-vision.mjs';
+import { proxyManager } from './proxy-manager.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -188,7 +189,7 @@ async function launchBrowser() {
 
   const execPath = process.env.EXEC_PATH || null;
 
-  // Configure proxy if enabled
+  // Configure proxy using Webshare.io API
   let proxyArg = '';
   let username;
   let password;
@@ -196,54 +197,48 @@ async function launchBrowser() {
   const useProxy = process.env.USE_PROXY === 'true';
   if (useProxy) {
     try {
-      const proxyList = process.env.PROXY_LIST_PATH;
-      if (!proxyList) {
-        throw new Error('PROXY_LIST_PATH environment variable is not set');
+      const proxy = await proxyManager.getRandomProxy();
+      if (proxy) {
+        proxyArg = `--proxy-server=${proxy.host}:${proxy.port}`;
+        username = proxy.username;
+        password = proxy.password;
+        logger.info(`Using proxy: ${proxy.host}:${proxy.port}`);
+      } else {
+        throw new Error('No proxy available from Webshare.io API');
       }
-
-      const readProxyList = await fs.readFile(proxyList, 'utf8');
-      const proxies = readProxyList.split('\n').filter(Boolean);
-
-      if (proxies.length === 0) {
-        throw new Error('Proxy list is empty');
-      }
-
-      const proxy = proxies[Math.floor(Math.random() * proxies.length)];
-      const [ip, port, username, password] = proxy.split(':');
-
-      if (!ip || !port || !username || !password) {
-        throw new Error('Invalid proxy format. Expected format: ip:port:username:password');
-      }
-
-      proxyArg = `--proxy-server=${ip}:${port}`;
-      logger.info(`Using proxy: ${ip}:${port}`);
-
     } catch (error) {
       logger.error('Failed to configure proxy:', error);
       proxyArg = null;
     }
   }
 
+  // Prepare launch arguments
+  const args = [
+    '--window-size=1280,800',
+    '--disable-web-security',
+    '--disable-features=IsolateOrigins,site-per-process,FedCM,BlockInsecurePrivateNetworkRequests',
+    '--disable-site-isolation-trials',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--disable-accelerated-2d-canvas',
+    '--no-first-run',
+    '--no-zygote',
+    '--disable-notifications',
+    '--hide-scrollbars',
+    '--mute-audio'
+  ];
+
+  // Add proxy argument if available
+  if (proxyArg) {
+    args.unshift(proxyArg);
+  }
+
   const browser = await puppeteer.launch({
-    headless: true,
+    headless: false,
     executablePath: execPath,
-    args: [
-      proxyArg,
-      '--window-size=1280,800',
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process,FedCM,BlockInsecurePrivateNetworkRequests',
-      '--disable-site-isolation-trials',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-gpu',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-notifications',
-      '--hide-scrollbars',
-      '--mute-audio',
-    ],
+    args,
     ignoreHTTPSErrors: true,
     defaultViewport: {
       width: 1280,

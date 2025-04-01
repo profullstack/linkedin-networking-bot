@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  linkedin-bot:
+    build: .
+    volumes:
+      - ./sessions:/app/sessions
+      - ./config.json:/app/config.json
+      - ./.env:/app/.env
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    init: true
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
