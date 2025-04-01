@@ -8,8 +8,8 @@ import readline from 'readline';
 import dotenv from 'dotenv';
 import { existsSync, mkdirSync } from 'fs';
 import { logger } from './logger.mjs';
-
-
+import { rateLimiter } from './rate-limiter.mjs';
+import { analyzeCaptchaBox, analyzePuzzleCaptcha, initOpenAI } from './openai-vision.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -43,7 +43,7 @@ async function saveScreenshot(page, prefix, description = '') {
   const timestamp = dayjs().format('YYYY-MM-DD_HH-mm-ss');
   const filename = `${prefix}_${timestamp}.png`;
   const filepath = path.join(logsDir, filename);
-  
+
   try {
     await page.screenshot({ path: filepath });
     const logDesc = description || prefix.replace(/-/g, ' ');
@@ -86,24 +86,24 @@ async function deduplicateProfiles(filePath) {
   try {
     logger.info(`Deduplicating profiles in ${filePath}...`);
     const profiles = await loadJson(filePath);
-    
+
     if (profiles.length === 0) {
       logger.info(`No profiles found in ${filePath}`);
       return;
     }
-    
+
     logger.info(`Found ${profiles.length} profiles in ${filePath}`);
-    
+
     // Create a map to store unique profiles by URL
     const uniqueProfiles = new Map();
-    
+
     // Process each profile
     for (const profile of profiles) {
       if (!profile.profileUrl) {
         logger.warn(`Skipping profile without URL: ${JSON.stringify(profile)}`);
         continue;
       }
-      
+
       // Fix unknown names if possible
       if (profile.name === 'Unknown' && profile.profileUrl) {
         try {
@@ -123,19 +123,19 @@ async function deduplicateProfiles(filePath) {
           logger.error('Error extracting name from URL', error);
         }
       }
-      
+
       // Only keep the most recent entry for each profileUrl
-      if (!uniqueProfiles.has(profile.profileUrl) || 
-          new Date(profile.date) > new Date(uniqueProfiles.get(profile.profileUrl).date)) {
+      if (!uniqueProfiles.has(profile.profileUrl) ||
+        new Date(profile.date) > new Date(uniqueProfiles.get(profile.profileUrl).date)) {
         uniqueProfiles.set(profile.profileUrl, profile);
       }
     }
-    
+
     // Convert map back to array
     const deduplicated = Array.from(uniqueProfiles.values());
-    
+
     logger.info(`Reduced to ${deduplicated.length} unique profiles`);
-    
+
     // Save the deduplicated list back to the file
     if (deduplicated.length !== profiles.length) {
       await saveJson(filePath, deduplicated);
@@ -166,20 +166,20 @@ async function promptForCredentials() {
   // Try to get credentials from .env file first
   let username = process.env.LINKEDIN_USER;
   let password = process.env.LINKEDIN_PASSWORD;
-  
+
   // If either credential is missing, prompt for it
   if (!username) {
     username = await promptForInput('Enter your LinkedIn username/email: ');
   } else {
     logger.info('Using LinkedIn username from .env file');
   }
-  
+
   if (!password) {
     password = await promptForInput('Enter your LinkedIn password: ');
   } else {
     logger.info('Using LinkedIn password from .env file');
   }
-  
+
   return { username, password };
 }
 
@@ -188,10 +188,47 @@ async function launchBrowser() {
 
   const execPath = process.env.EXEC_PATH || null;
 
+  // Configure proxy if enabled
+  let proxyArg = '';
+  let username;
+  let password;
+
+  const useProxy = process.env.USE_PROXY === 'true';
+  if (useProxy) {
+    try {
+      const proxyList = process.env.PROXY_LIST_PATH;
+      if (!proxyList) {
+        throw new Error('PROXY_LIST_PATH environment variable is not set');
+      }
+
+      const readProxyList = await fs.readFile(proxyList, 'utf8');
+      const proxies = readProxyList.split('\n').filter(Boolean);
+
+      if (proxies.length === 0) {
+        throw new Error('Proxy list is empty');
+      }
+
+      const proxy = proxies[Math.floor(Math.random() * proxies.length)];
+      const [ip, port, username, password] = proxy.split(':');
+
+      if (!ip || !port || !username || !password) {
+        throw new Error('Invalid proxy format. Expected format: ip:port:username:password');
+      }
+
+      proxyArg = `--proxy-server=${ip}:${port}`;
+      logger.info(`Using proxy: ${ip}:${port}`);
+
+    } catch (error) {
+      logger.error('Failed to configure proxy:', error);
+      proxyArg = null;
+    }
+  }
+
   const browser = await puppeteer.launch({
     headless: false,
     executablePath: execPath,
     args: [
+      proxyArg,
       '--window-size=1280,800',
       '--disable-web-security',
       '--disable-features=IsolateOrigins,site-per-process,FedCM,BlockInsecurePrivateNetworkRequests',
@@ -219,7 +256,15 @@ async function launchBrowser() {
   });
 
   const page = await browser.newPage();
-  
+
+  if (useProxy) {
+    // Set up proxy authentication in Puppeteer
+    await page.authenticate({
+      username,
+      password
+    });
+  }
+
   // Define a list of common user agents with recent browser versions
   const userAgents = [
     // Chrome on Windows
@@ -237,13 +282,13 @@ async function launchBrowser() {
   // Select a random user agent
   const randomUserAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
   await page.setUserAgent(randomUserAgent);
-  
+
   // Set extra HTTP headers to mimic a real browser
   await page.setExtraHTTPHeaders({
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
   });
-  
+
   // Modify the navigator object to avoid detection
   await page.evaluateOnNewDocument(() => {
     // Overwrite the 'webdriver' property to make it undefined
@@ -251,7 +296,7 @@ async function launchBrowser() {
       get: () => undefined
     });
   });
-  
+
   // Only log errors and warnings to reduce noise
   page.on('console', msg => {
     const type = msg.type();
@@ -259,13 +304,13 @@ async function launchBrowser() {
       console.log(`Browser ${type}:`, msg.text());
     }
   });
-  
+
   // Set default navigation timeout to be longer
   page.setDefaultNavigationTimeout(90000);
-  
+
   // Set default timeout for waitForSelector, etc.
   page.setDefaultTimeout(80000);
-  
+
   return { browser, page };
 }
 
@@ -273,7 +318,7 @@ async function saveCookies(page) {
   try {
     // Get all cookies from the page
     const cookies = await page.cookies();
-    
+
     // Filter out any invalid or expired cookies
     const validCookies = cookies.filter(cookie => {
       // Check if cookie has expired
@@ -281,40 +326,40 @@ async function saveCookies(page) {
         logger.info(`Skipping expired cookie: ${cookie.name}`);
         return false;
       }
-      
+
       // Ensure essential properties exist
       if (!cookie.name || !cookie.value) {
         logger.info(`Skipping invalid cookie: ${JSON.stringify(cookie)}`);
         return false;
       }
-      
+
       // Keep only linkedin.com related cookies
       if (!cookie.domain.includes('linkedin.com')) {
         logger.info(`Skipping non-LinkedIn cookie: ${cookie.name}`);
         return false;
       }
-      
+
       // Check for essential LinkedIn cookies
       const essentialCookies = ['li_at', 'JSESSIONID'];
       const hasEssentialCookies = essentialCookies.some(name => cookie.name === name);
-      
+
       return true;
     });
-    
+
     // Verify we have essential cookies
     const essentialCookies = ['li_at', 'JSESSIONID'];
-    const missingEssentials = essentialCookies.filter(name => 
+    const missingEssentials = essentialCookies.filter(name =>
       !validCookies.some(cookie => cookie.name === name)
     );
-    
+
     if (missingEssentials.length > 0) {
       throw new Error(`Missing essential cookies: ${missingEssentials.join(', ')}`);
     }
-    
+
     if (validCookies.length === 0) {
       throw new Error('No valid cookies found');
     }
-    
+
     // Save filtered cookies
     await saveJson(cookiesFile, validCookies);
     logger.info(`Saved ${validCookies.length} valid cookies`);
@@ -326,21 +371,30 @@ async function saveCookies(page) {
 }
 
 async function sendOneConnectionRequest(page) {
-  console.log('Processing search results to find connection opportunities...');
-  
+  // Check daily connection limit before proceeding
+  if (!(await rateLimiter.checkConnectionLimit())) {
+    logger.info('Daily connection limit reached. Try again tomorrow.');
+    return false;
+  }
+
+  // Wait for appropriate delay before next action
+  await rateLimiter.waitForNextAction();
+
+  logger.info('Processing search results to find connection opportunities...');
+
   // First, ensure we're logged in
   const isLoggedIn = await checkIfLoggedIn(page);
   if (!isLoggedIn) {
     console.log('Not logged in. Cannot process search results.');
     return false;
   }
-  
+
   // Save cookies after successful navigation
   await saveCookies(page);
-  
+
   // Take a screenshot of the current search results page
   await saveScreenshot(page, 'search-results', 'search results page');
-  
+
   // Log current URL for debugging
   const currentUrl = page.url();
   console.log(`Current URL when processing search results: ${currentUrl}`);
@@ -370,10 +424,10 @@ async function sendOneConnectionRequest(page) {
     'div[data-member-id]',
     'div[data-member-urn]'
   ];
-  
+
   let resultsSelector = null;
   let foundResults = false;
-  
+
   // Try each selector until we find one that works
   for (const selector of possibleSelectors) {
     try {
@@ -397,7 +451,7 @@ async function sendOneConnectionRequest(page) {
     const timestamp = dayjs().format('YYYY-MM-DD_HH-mm-ss');
     await page.screenshot({ path: path.join(logsDir, `search-page-no-results_${timestamp}.png`) });
     console.log(`Saved screenshot to logs/search-page-no-results_${timestamp}.png`);
-    
+
     // Try to extract any links that might be profile links
     console.log('Attempting to find profile links directly...');
     const profileLinks = await page.$$eval('a[href*="/in/"]', links => {
@@ -406,17 +460,17 @@ async function sendOneConnectionRequest(page) {
         text: link.innerText.trim()
       }));
     });
-    
+
     console.log(`Found ${profileLinks.length} profile links:`);
     for (const link of profileLinks.slice(0, 5)) { // Show first 5 links
       console.log(`- ${link.text}: ${link.href}`);
     }
-    
+
     if (profileLinks.length > 0) {
       console.log('Clicking on the first profile link...');
       await page.click(`a[href*="${profileLinks[0].href.split('/in/')[1].split('?')[0]}"]`);
       await page.waitForTimeout(5000);
-      
+
       // Now we're on a profile page, look for a connect button
       const connectButtonSelectors = [
         'button.pv-s-profile-actions--connect',
@@ -424,9 +478,9 @@ async function sendOneConnectionRequest(page) {
         'button.artdeco-button--secondary',
         '.pv-top-card-v2-ctas button'
       ];
-      
+
       let connectButtonFound = false;
-      
+
       for (const buttonSelector of connectButtonSelectors) {
         try {
           const connectButton = await page.$(buttonSelector);
@@ -441,7 +495,7 @@ async function sendOneConnectionRequest(page) {
           console.log(`Error with button selector ${buttonSelector}: ${error.message}`);
         }
       }
-      
+
       if (connectButtonFound) {
         // Look for the send button in the modal
         const sendButtonSelectors = [
@@ -449,7 +503,7 @@ async function sendOneConnectionRequest(page) {
           'button[aria-label="Send now"]',
           'button[aria-label="Send invitation"]'
         ];
-        
+
         for (const sendSelector of sendButtonSelectors) {
           try {
             const sendButton = await page.$(sendSelector);
@@ -466,7 +520,7 @@ async function sendOneConnectionRequest(page) {
         }
       }
     }
-    
+
     return false;
   }
 
@@ -477,7 +531,7 @@ async function sendOneConnectionRequest(page) {
   // Iterate through results to find one that has a Connect button
   for (let i = 0; i < Math.min(results.length, 10); i++) {
     console.log(`Checking result ${i + 1}...`);
-    
+
     // Try to find the connect button
     const connectButtonSelectors = [
       'button.artdeco-button--secondary',
@@ -485,10 +539,10 @@ async function sendOneConnectionRequest(page) {
       'button[aria-label*="Connect"]',
       'button[data-control-name="connect"]'
     ];
-    
+
     let connectButton = null;
     let connectButtonSelector = null;
-    
+
     for (const selector of connectButtonSelectors) {
       try {
         connectButton = await results[i].$(selector);
@@ -500,18 +554,18 @@ async function sendOneConnectionRequest(page) {
         console.log(`Error finding connect button with selector ${selector}: ${error.message}`);
       }
     }
-    
+
     if (!connectButton) {
       console.log(`No connect button found for result ${i + 1}, trying next result...`);
       continue;
     }
-    
+
     console.log(`Found connect button for result ${i + 1} with selector: ${connectButtonSelector}`);
-    
+
     // Get profile info
     let profileName = 'Unknown';
     let profileUrl = '';
-    
+
     // Try multiple selectors for profile name
     const nameSelectors = [
       'span.entity-result__title-text', // Standard search results
@@ -523,7 +577,7 @@ async function sendOneConnectionRequest(page) {
       'span.profile-name', // Another possible location
       'a[href*="/in/"]' // Last resort - get name from link text
     ];
-    
+
     for (const selector of nameSelectors) {
       try {
         const nameElement = await results[i].$(selector);
@@ -540,14 +594,14 @@ async function sendOneConnectionRequest(page) {
         console.log(`Error getting profile name with selector ${selector}: ${error.message}`);
       }
     }
-    
+
     // Try multiple selectors for profile URL
     const urlSelectors = [
       'a[href*="/in/"]', // Standard profile links
       'a.app-aware-link[href*="/in/"]', // App-aware links
       'a.artdeco-entity-lockup__link[href*="/in/"]' // Entity lockup links
     ];
-    
+
     for (const selector of urlSelectors) {
       try {
         const urlElement = await results[i].$(selector);
@@ -562,7 +616,7 @@ async function sendOneConnectionRequest(page) {
         console.log(`Error getting profile URL with selector ${selector}: ${error.message}`);
       }
     }
-    
+
     // If we still don't have a name but have a URL, try to extract name from URL
     if (profileName === 'Unknown' && profileUrl) {
       try {
@@ -582,14 +636,22 @@ async function sendOneConnectionRequest(page) {
         logger.error('Error extracting name from URL', error);
       }
     }
-    
+
     console.log(`Sending connection request to: ${profileName} (${profileUrl})`);
-    
+
     // Click the connect button
     try {
       await connectButton.click();
       await page.waitForTimeout(2000);
       
+      // Check if we hit a rate limit
+      if (await rateLimiter.handleRateLimit(page)) {
+        return false;
+      }
+      
+      // Increment connection count on successful click
+      await rateLimiter.incrementConnectionCount();
+
       // Check if there's a follow-up dialog (e.g., add note, send anyway)
       const sendButtonSelectors = [
         'button.artdeco-button--primary',
@@ -597,9 +659,9 @@ async function sendOneConnectionRequest(page) {
         'button[aria-label="Send now"]',
         'button[aria-label="Send invitation"]'
       ];
-      
+
       let sendButton = null;
-      
+
       for (const sendSelector of sendButtonSelectors) {
         try {
           sendButton = await page.$(sendSelector);
@@ -613,13 +675,13 @@ async function sendOneConnectionRequest(page) {
           console.log(`Error with send button selector ${sendSelector}: ${error.message}`);
         }
       }
-      
+
       // Load existing pending connections
       const pending = await loadJson(pendingFile);
-      
+
       // Check if this profile URL already exists in pending
       const isDuplicate = pending.some(p => p.profileUrl === profileUrl);
-      
+
       if (isDuplicate) {
         console.log(`⚠️ Profile ${profileName} (${profileUrl}) is already in pending list. Skipping.`);
       } else {
@@ -632,7 +694,7 @@ async function sendOneConnectionRequest(page) {
         await saveJson(pendingFile, pending);
         console.log(`✅ Connection request sent to ${profileName} and added to pending list`);
       }
-      
+
       console.log(`✅ Connection request sent to ${profileName}`);
       return true;
     } catch (error) {
@@ -641,7 +703,7 @@ async function sendOneConnectionRequest(page) {
       await saveScreenshot(page, 'connection-error', 'connection error');
     }
   }
-  
+
   console.log('Could not send any connection requests.');
   return false;
 }
@@ -649,19 +711,19 @@ async function sendOneConnectionRequest(page) {
 async function sendOneFollowUpMessage(page) {
   const pending = await loadJson(pendingFile);
   const messaged = await loadJson(messagedFile);
-  
+
   // Filter for connections that were added more than 1 day ago
   const yesterday = dayjs().subtract(1, 'day').format('YYYY-MM-DD');
   const connectionsToMessage = pending.filter(c => c.date < yesterday && !messaged.find(m => m.profileUrl === c.profileUrl));
-  
+
   if (connectionsToMessage.length === 0) {
     console.log('No pending connections to message.');
     return false;
   }
-  
+
   console.log(`Found ${connectionsToMessage.length} connections to message.`);
   console.log('Navigating to connections page...');
-  
+
   try {
     await page.goto('https://www.linkedin.com/mynetwork/invite-connect/connections/', { waitUntil: 'networkidle2' });
     await page.waitForSelector('.mn-connection-card', { timeout: 80000 });
@@ -672,14 +734,14 @@ async function sendOneFollowUpMessage(page) {
     console.log('Current URL:', page.url());
     console.log('Attempting to continue with available elements...');
   }
-  
+
   const connections = await page.$$eval('.mn-connection-card', cards =>
     cards.map(card => ({
       name: card.querySelector('.mn-connection-card__name')?.innerText.trim(),
       profileUrl: card.querySelector('a.mn-connection-card__link')?.href
     }))
   );
-  
+
   for (const user of pending) {
     if (connections.find(c => c.profileUrl === user.profileUrl) && !messaged.find(m => m.profileUrl === user.profileUrl)) {
       console.log(`Sending follow-up message to ${user.name}`);
@@ -706,7 +768,7 @@ async function checkForSmsVerification(page) {
     await tryAnotherWay.click()
 
     await page.waitForTimeout(5000)
-    
+
     // Wait for the SMS code input field
     const smsInput = await page.waitForSelector('input#input__phone_verification_pin', { timeout: 15000 });
     if (!smsInput) {
@@ -728,7 +790,7 @@ async function checkForSmsVerification(page) {
     }
     await submitButton.click();
     console.log('Submitted SMS code, waiting for navigation...');
-    
+
     const currentUrl = page.url();
     const success = !currentUrl.includes('/checkpoint/challenge/');
     console.log(`SMS verification ${success ? 'succeeded' : 'failed'}. Current URL: ${currentUrl}`);
@@ -758,7 +820,7 @@ async function checkIfLoggedIn(page) {
     // Check cookies first
     const cookies = await page.cookies();
     const essentialCookies = ['li_at', 'JSESSIONID'];
-    const missingCookies = essentialCookies.filter(name => 
+    const missingCookies = essentialCookies.filter(name =>
       !cookies.some(cookie => cookie.name === name)
     );
 
@@ -841,13 +903,13 @@ async function loginWithCredentials(page, username, password) {
       // Standard login form with both username and password fields
       console.log('Standard login form detected...');
 
-    // Wait for login form
-    await page.waitForSelector('#username', { timeout: 80000 });
-    await page.waitForSelector('#password', { timeout: 80000 });
+      // Wait for login form
+      await page.waitForSelector('#username', { timeout: 80000 });
+      await page.waitForSelector('#password', { timeout: 80000 });
 
-    // Type credentials with random delays
-    await page.type('#username', username, { delay: Math.floor(Math.random() * 100) + 50 });
-    await page.type('#password', password, { delay: Math.floor(Math.random() * 100) + 50 });
+      // Type credentials with random delays
+      await page.type('#username', username, { delay: Math.floor(Math.random() * 100) + 50 });
+      await page.type('#password', password, { delay: Math.floor(Math.random() * 100) + 50 });
     }
 
     // Click sign in and wait for navigation
@@ -862,15 +924,15 @@ async function loginWithCredentials(page, username, password) {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      
+
       // Add missing chrome properties
       window.chrome = {
         runtime: {},
-        loadTimes: function() {},
-        csi: function() {},
+        loadTimes: function () { },
+        csi: function () { },
         app: {}
       };
-      
+
       // Modify permissions behavior
       const originalQuery = window.navigator.permissions.query;
       window.navigator.permissions.query = (parameters) => (
@@ -879,12 +941,12 @@ async function loginWithCredentials(page, username, password) {
           originalQuery(parameters)
       );
     });
-    
+
     // Set a realistic user agent with random minor version
     const minorVersion = Math.floor(Math.random() * 99);
     const userAgent = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.${minorVersion}.0 Safari/537.36`;
     await page.setUserAgent(userAgent);
-    
+
     // Clear all cookies and cache before starting
     try {
       const client = await page.target().createCDPSession();
@@ -912,22 +974,22 @@ async function loginWithCredentials(page, username, password) {
       logger.error('Error setting up browser session:', error);
       // Continue with login attempt even if session setup fails
     }
-    
+
     console.log('Navigating to LinkedIn login page...');
     await page.goto('https://www.linkedin.com/login', {
       waitUntil: 'domcontentloaded',
-      timeout: 80000 
+      timeout: 80000
     });
-    
+
     // Simulate human typing behavior for username
     console.log('Entering username...');
     for (let i = 0; i < username.length; i++) {
-        const delay = Math.random() < 0.1 ? 
-            Math.floor(Math.random() * 1000 + 500) : // Occasional pause
-            Math.floor(Math.random() * 150 + 50);   // Normal typing
+      const delay = Math.random() < 0.1 ?
+        Math.floor(Math.random() * 1000 + 500) : // Occasional pause
+        Math.floor(Math.random() * 150 + 50);   // Normal typing
 
-        await page.type('#username', username[i], {delay: 120});
-        await page.waitForTimeout(delay);
+      await page.type('#username', username[i], { delay: 120 });
+      await page.waitForTimeout(delay);
     }
 
     // Natural pause between username and password
@@ -935,20 +997,20 @@ async function loginWithCredentials(page, username, password) {
 
     console.log('Entering password...');
     for (let i = 0; i < password.length; i++) {
-        const delay = Math.random() < 0.1 ? 
-            Math.floor(Math.random() * 1000 + 500) : // Occasional pause
-            Math.floor(Math.random() * 150 + 50);   // Normal typing
+      const delay = Math.random() < 0.1 ?
+        Math.floor(Math.random() * 1000 + 500) : // Occasional pause
+        Math.floor(Math.random() * 150 + 50);   // Normal typing
 
-        await page.type('#password', password[i], {delay: 120});
-        await page.waitForTimeout(delay);
+      await page.type('#password', password[i], { delay: 120 });
+      await page.waitForTimeout(delay);
     }
 
     // Natural pause after entering credentials
     await page.waitForTimeout(Math.floor(Math.random() * 3000 + 1500));
-    
+
     // Click sign in button and handle navigation with fallbacks
     console.log('Clicking sign in button...');
-    
+
     // Take screenshot before clicking sign in
     await saveScreenshot(page, 'before-signin-click', 'Before clicking sign in button');
 
@@ -1003,90 +1065,22 @@ async function loginWithCredentials(page, username, password) {
 
         await page.waitForTimeout(60000)
 
-        console.log('Clicking verify button')
-
-        const clickVerifyButton = await page.$('#home_children_button')
-        clickVerifyButton.click()
-
-        await page.waitForTimeout(60000)
-
-        // detect challenge game
-        const detectChallengeGame = await page.$('#EnforcementChallenge')
-
-        if(!detectChallengeGame) {
-          console.log('Game challenge not found')
-        } else {
-          console.log('Game challenge found')
-        }
-
-        await page.waitForTimeout(60000)
-        
-        const screenshot = await detectChallengeGame.screenshot({
-          encoding: 'base64'
-        });
-        
-        // If AI solving is enabled, try to solve with OpenAI Vision
-        if (process.env.USE_AI === 'true' && process.env.OPENAI_API_KEY) {
-          try {
-            const { initOpenAI, analyzePuzzleCaptcha } = await import('./openai-vision.mjs');
-            initOpenAI(process.env.OPENAI_API_KEY);
-            
-            console.log('Analyzing puzzle with AI...');
-            const solution = await analyzePuzzleCaptcha(screenshot);
-            console.log('AI Analysis:', solution);
-            
-            // Parse the AI solution
-            const parsedSolution = JSON.parse(solution);
-            
-            // Get puzzle element dimensions and position
-            const puzzleBounds = await puzzleElement.boundingBox();
-            
-            // Calculate absolute coordinates based on puzzle element position
-            const clickX = puzzleBounds.x + parsedSolution.click_coordinates.x;
-            const clickY = puzzleBounds.y + parsedSolution.click_coordinates.y;
-            
-            // Move mouse to coordinates with human-like motion
-            await page.mouse.move(clickX, clickY, {
-              steps: 25 // More steps = smoother motion
-            });
-            
-            // Add small random delay before clicking
-            await page.waitForTimeout(Math.random() * 500 + 200);
-            
-            // Click to rotate puzzle
-            await page.mouse.click(clickX, clickY);
-            
-            // Wait for rotation animation
-            await page.waitForTimeout(1000);
-            
-            // Save screenshot for verification
-            await saveScreenshot(page, 'puzzle-captcha-solved', 'Puzzle captcha after rotation');
-            
-            // Wait for navigation after solving
-            await page.waitForNavigation({ timeout: 10000 }).catch(() => {});
-            return true;
-          } catch (error) {
-            console.error('Error using AI for puzzle analysis:', error);
-          }
-        }
-        
         console.log('Please solve the puzzle manually.');
         await saveScreenshot(page, 'puzzle-captcha', 'Puzzle captcha challenge screenshot');
         return false;
       }
-      
+
       // Check if SMS verification is needed by looking for 'Enter the code' text
       const hasEnterCodeText = await page.evaluate(() => {
         return document.body.innerText.includes('Enter the code');
       });
-      
+
       if (hasEnterCodeText) {
         console.log('Detected SMS verification challenge. Initiating SMS verification...');
         await checkForSmsVerification(page);
       } else {
         console.log('SMS verification challenge not detected.');
       }
-
 
       return false;
     } else {
@@ -1102,14 +1096,69 @@ async function loginWithCredentials(page, username, password) {
     }
 
     console.log('Login successful!');
-    
+
     return true;
-    
+
   } catch (error) {
     console.log(error)
     console.error(`Login error: ${error.message}`);
     await saveScreenshot(page, 'login-error', 'Login error screenshot');
     return false;
+  }
+}
+
+async function useVision(page, screenshot, action = 'solve-puzzle', prompt = 'Identify where the verify button is at') {
+  try {
+    initOpenAI(process.env.OPENAI_API_KEY);
+
+    let fn = ''
+
+    switch(action) {
+      case 'solve-puzzle':
+        fn = await analyzePuzzleCaptcha(screenshot)
+        break;
+
+      case 'click-button':
+        fn = await analyzeCaptchaBox(screenshot, prompt);
+        break;
+    }
+
+    console.log('Analyzing screenshot with AI...');
+    const solution = fn;
+    console.log('AI Analysis:', solution);
+
+    // Parse the AI solution
+    const parsedSolution = JSON.parse(solution);
+
+    // Get puzzle element dimensions and position
+    const puzzleBounds = await puzzleElement.boundingBox();
+
+    // Calculate absolute coordinates based on puzzle element position
+    const clickX = puzzleBounds.x + parsedSolution.click_coordinates.x;
+    const clickY = puzzleBounds.y + parsedSolution.click_coordinates.y;
+
+    // Move mouse to coordinates with human-like motion
+    await page.mouse.move(clickX, clickY, {
+      steps: 25 // More steps = smoother motion
+    });
+
+    // Add small random delay before clicking
+    await page.waitForTimeout(Math.random() * 500 + 200);
+
+    // Click to rotate puzzle
+    await page.mouse.click(clickX, clickY);
+
+    // Wait for rotation animation
+    await page.waitForTimeout(1000);
+
+    // Save screenshot for verification
+    await saveScreenshot(page, action, action);
+
+    // Wait for navigation after solving
+    await page.waitForNavigation({ timeout: 10000 }).catch(() => { });
+    return true;
+  } catch (error) {
+    console.error('Error using AI for puzzle analysis:', error);
   }
 }
 
@@ -1138,7 +1187,7 @@ async function main() {
     }
 
     // Navigate to LinkedIn and check login status
-    await page.goto('https://www.linkedin.com', { waitUntil: 'domcontentloaded', timeout: 80000 });
+    await page.goto('https://www.linkedin.com', { waitUntil: 'domcontentloaded', timeout: 0 });
     isLoggedIn = await checkIfLoggedIn(page);
 
     if (!isLoggedIn) {
