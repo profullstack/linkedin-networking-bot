@@ -9,6 +9,15 @@ A Puppeteer-based bot that sends one connection request and one follow-up messag
 ```bash
 pnpm install
 ```
+4. Setup env
+```bash
+cp -a sample.env .env
+```
+4. Use Proxy (optional)
+```bash (.env)
+...
+USE_PROXY=true
+```
 4. Start:
 ```bash
 pnpm start

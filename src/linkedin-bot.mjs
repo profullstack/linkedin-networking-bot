@@ -225,7 +225,7 @@ async function launchBrowser() {
   }
 
   const browser = await puppeteer.launch({
-    headless: false,
+    headless: true,
     executablePath: execPath,
     args: [
       proxyArg,
