@@ -11,6 +11,8 @@ import { logger } from './logger.mjs';
 import { rateLimiter } from './rate-limiter.mjs';
 import { analyzeCaptchaBox, analyzePuzzleCaptcha, initOpenAI } from './openai-vision.mjs';
 import { proxyManager } from './proxy-manager.mjs';
+import { captchaSolver } from './captcha-solver.mjs';
+import { sessionManager } from './session-manager.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,6 +25,9 @@ const logsDir = path.join(__dirname, '../logs');
 
 // Load environment variables from .env file
 dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), '../.env') });
+
+// Initialize OpenAI for captcha analysis
+await initOpenAI();
 
 // Ensure logs directory exists
 function ensureLogsDir() {
@@ -215,19 +220,7 @@ async function launchBrowser() {
   // Prepare launch arguments
   const args = [
     '--window-size=1280,800',
-    '--disable-web-security',
-    '--disable-features=IsolateOrigins,site-per-process,FedCM,BlockInsecurePrivateNetworkRequests',
-    '--disable-site-isolation-trials',
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-gpu',
-    '--disable-dev-shm-usage',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-zygote',
-    '--disable-notifications',
-    '--hide-scrollbars',
-    '--mute-audio'
+    
   ];
 
   // Add proxy argument if available
@@ -812,15 +805,9 @@ async function checkIfLoggedIn(page) {
       return false;
     }
 
-    // Check cookies first
-    const cookies = await page.cookies();
-    const essentialCookies = ['li_at', 'JSESSIONID'];
-    const missingCookies = essentialCookies.filter(name =>
-      !cookies.some(cookie => cookie.name === name)
-    );
-
-    if (missingCookies.length > 0) {
-      logger.info(`Missing essential cookies: ${missingCookies.join(', ')}`);
+    // Validate session using session manager
+    const isValidSession = await sessionManager.validateSession(page);
+    if (!isValidSession) {
       return false;
     }
 
@@ -903,15 +890,63 @@ async function loginWithCredentials(page, username, password) {
       await page.waitForSelector('#password', { timeout: 80000 });
 
       // Type credentials with random delays
-      await page.type('#username', username, { delay: Math.floor(Math.random() * 100) + 50 });
-      await page.type('#password', password, { delay: Math.floor(Math.random() * 100) + 50 });
+      // Simulate human-like typing for username with variable delays and occasional pauses
+      for (const char of username) {
+        // Add random delay between keystrokes (50-200ms)
+        const baseDelay = Math.floor(Math.random() * 150) + 50;
+        
+        // 10% chance of a longer pause (500-1500ms) to simulate human thinking
+        const delay = Math.random() < 0.1 ? 
+          baseDelay + Math.floor(Math.random() * 1000) + 500 :
+          baseDelay;
+          
+        await page.type('#username', char, { delay });
+      }
+
+        // Natural pause between username and password fields (1-3 seconds)
+        await page.waitForTimeout(Math.floor(Math.random() * 2000) + 1000);
+
+        // Simulate human-like typing for password with variable delays and occasional pauses
+        for (const char of password) {
+          const baseDelay = Math.floor(Math.random() * 150) + 50;
+          
+          // 10% chance of a longer pause
+          const delay = Math.random() < 0.1 ?
+            baseDelay + Math.floor(Math.random() * 1000) + 500 :
+            baseDelay;
+            
+          await page.type('#password', char, { delay });
+        }
     }
+
+    await page.waitForTimeout(2000)
 
     // Click sign in and wait for navigation
     await Promise.all([
       page.click('button[type="submit"]'),
       page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 80000 })
     ]);
+
+    // Check for FunCaptcha after login attempt
+    if (page.url().includes('checkpoint') || page.url().includes('authwall')) {
+      logger.info('Detected potential captcha challenge...');
+      await saveScreenshot(page, 'captcha-challenge', 'captcha challenge page');
+
+      // Store current URL before solving captcha
+      const currentUrl = page.url();
+      
+      // Try to solve FunCaptcha if present
+      const token = await captchaSolver.solveFunCaptcha(page, currentUrl);
+      if (token) {
+        logger.info('Successfully obtained captcha solution');
+        // Wait for the solution to be applied and page to update
+        await page.waitForTimeout(2000);
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 80000 })
+          .catch(error => logger.warn('Navigation timeout after captcha solution:', error));
+      } else {
+        logger.warn('Failed to solve captcha challenge');
+      }
+    }
 
     // Configure browser stealth settings
     await page.evaluateOnNewDocument(() => {
@@ -939,35 +974,42 @@ async function loginWithCredentials(page, username, password) {
 
     // Set a realistic user agent with random minor version
     const minorVersion = Math.floor(Math.random() * 99);
-    const userAgent = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.${minorVersion}.0 Safari/537.36`;
+    const userAgent = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36`;
     await page.setUserAgent(userAgent);
 
-    // Clear all cookies and cache before starting
-    try {
-      const client = await page.target().createCDPSession();
-      await Promise.all([
-        client.send('Network.clearBrowserCookies'),
-        client.send('Network.clearBrowserCache'),
-        // Set custom request headers
-        client.send('Network.setExtraHTTPHeaders', {
-          headers: {
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"macOS"',
-            'Upgrade-Insecure-Requests': '1',
-            'User-Agent': userAgent,
-            'sec-fetch-dest': 'document',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'none',
-            'sec-fetch-user': '?1'
-          }
-        })
-      ]);
-    } catch (error) {
-      logger.error('Error setting up browser session:', error);
-      // Continue with login attempt even if session setup fails
+    // Check if we need to rotate proxy
+    if (sessionManager.shouldRotateProxy()) {
+      const newProxy = await proxyManager.getRandomProxy();
+      if (newProxy) {
+        // Clear all cookies and cache before switching proxy
+        try {
+          const client = await page.target().createCDPSession();
+          await Promise.all([
+            client.send('Network.clearBrowserCookies'),
+            client.send('Network.clearBrowserCache'),
+            // Set custom request headers
+            client.send('Network.setExtraHTTPHeaders', {
+              headers: {
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"macOS"',
+                'Upgrade-Insecure-Requests': '1', 
+                'User-Agent': userAgent,
+                'sec-fetch-dest': 'document',
+                'sec-fetch-mode': 'navigate',
+                'sec-fetch-site': 'none',
+                'sec-fetch-user': '?1'
+              }
+            })
+          ]);
+          sessionManager.markProxyRotated();
+          logger.info('Rotated to new proxy and cleared session data');
+        } catch (error) {
+          logger.error('Error setting up browser session:', error);
+        }
+      }
     }
 
     console.log('Navigating to LinkedIn login page...');
@@ -1171,7 +1213,7 @@ async function main() {
     let isLoggedIn = false;
 
     try {
-      const cookies = await loadJson(cookiesFile);
+      const cookies = await sessionManager.loadCookies();
       if (cookies.length > 0) {
         console.log(`Found ${cookies.length} saved cookies...`);
         await page.setCookie(...cookies);
@@ -1188,7 +1230,7 @@ async function main() {
     if (!isLoggedIn) {
       console.log('Not logged in. Prompting for credentials...');
       const { username, password } = await promptForCredentials();
-      isLoggedIn = await loginWithCredentials(page, username, password);
+      isLoggedIn = await sessionManager.handleLoginRetry(page, username, password, loginWithCredentials);
 
       if (!isLoggedIn) {
         console.log('Login failed. Exiting...');
@@ -1237,7 +1279,7 @@ async function main() {
     await saveScreenshot(page, 'error-screenshot', 'error');
   } finally {
     try {
-      await saveCookies(page);
+      await sessionManager.saveCookies(page);
       console.log('Final session cookies saved.');
     } catch (error) {
       console.error('Error saving cookies:', error.message);

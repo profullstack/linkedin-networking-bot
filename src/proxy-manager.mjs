@@ -2,6 +2,11 @@ import { logger } from './logger.mjs';
 import fs from 'fs/promises';
 import path from 'path';
 
+import dotenv from 'dotenv'
+import { fileURLToPath } from 'url';
+
+dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), '../.env') });
+
 class ProxyManager {
   constructor() {
     this.proxyApiUrl = 'https://proxy.webshare.io/api/v2/proxy/list/';
