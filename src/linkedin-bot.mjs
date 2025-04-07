@@ -204,10 +204,14 @@ async function launchBrowser() {
     try {
       const proxy = await proxyManager.getRandomProxy();
       if (proxy) {
-        proxyArg = `--proxy-server=${proxy.host}:${proxy.port}`;
+        // Ensure port is a number
+        const port = typeof proxy.port === 'string' ? parseInt(proxy.port, 10) : proxy.port;
+        
+        proxyArg = `--proxy-server=http://${proxy.host}:${port}`;
         username = proxy.username;
         password = proxy.password;
-        logger.info(`Using proxy: ${proxy.host}:${proxy.port}`);
+        
+        logger.info(`Using proxy: ${proxy.host}:${port} (${username})`);
       } else {
         throw new Error('No proxy available from Webshare.io API');
       }
@@ -220,16 +224,26 @@ async function launchBrowser() {
   // Prepare launch arguments
   const args = [
     '--window-size=1280,800',
-    
+    '--disable-blink-features=AutomationControlled'
   ];
 
-  // Add proxy argument if available
+  // Add proxy and other security arguments
   if (proxyArg) {
     args.unshift(proxyArg);
+    args.push(
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-infobars',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--disable-gpu'
+    );
   }
 
   const browser = await puppeteer.launch({
-    headless: false,
+    headless: true,
     executablePath: execPath,
     args,
     ignoreHTTPSErrors: true,
@@ -245,12 +259,23 @@ async function launchBrowser() {
 
   const page = await browser.newPage();
 
-  if (useProxy) {
-    // Set up proxy authentication in Puppeteer
-    await page.authenticate({
-      username,
-      password
-    });
+  if (useProxy && username && password) {
+    try {
+      // Set up proxy authentication in Puppeteer
+      await page.authenticate({
+        username,
+        password
+      });
+      
+      // Additional authentication headers for some proxy services
+      await page.setExtraHTTPHeaders({
+        'Proxy-Authorization': 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64')
+      });
+      
+      logger.info('Proxy authentication configured');
+    } catch (error) {
+      logger.error('Failed to set up proxy authentication:', error);
+    }
   }
 
   // Define a list of common user agents with recent browser versions
@@ -389,7 +414,8 @@ async function sendOneConnectionRequest(page) {
 
   // Wait for page to load completely
   console.log('Waiting for page to load completely...');
-  await page.waitForTimeout(5000); // Give the page some time to load
+  //await page.waitForTimeout(5000); // Give the page some time to load
+  await new Promise(r => setTimeout(r, 5000))
 
   // Try multiple possible selectors for search results
   const possibleSelectors = [
@@ -457,7 +483,8 @@ async function sendOneConnectionRequest(page) {
     if (profileLinks.length > 0) {
       console.log('Clicking on the first profile link...');
       await page.click(`a[href*="${profileLinks[0].href.split('/in/')[1].split('?')[0]}"]`);
-      await page.waitForTimeout(5000);
+      //await page.waitForTimeout(5000);
+      await new Promise(r => setTimeout(r, 5000))
 
       // Now we're on a profile page, look for a connect button
       const connectButtonSelectors = [
@@ -475,7 +502,8 @@ async function sendOneConnectionRequest(page) {
           if (connectButton) {
             console.log(`Found connect button with selector: ${buttonSelector}`);
             await connectButton.click();
-            await page.waitForTimeout(2000);
+            //await page.waitForTimeout(2000);
+            await new Promise(r => setTimeout(r, 2000))
             connectButtonFound = true;
             break;
           }
@@ -498,7 +526,8 @@ async function sendOneConnectionRequest(page) {
             if (sendButton) {
               console.log(`Found send button with selector: ${sendSelector}`);
               await sendButton.click();
-              await page.waitForTimeout(2000);
+              //await page.waitForTimeout(2000);
+              await new Promise(r => setTimeout(r, 2000))
               console.log('Connection request sent!');
               return true;
             }
@@ -630,7 +659,8 @@ async function sendOneConnectionRequest(page) {
     // Click the connect button
     try {
       await connectButton.click();
-      await page.waitForTimeout(2000);
+      //await page.waitForTimeout(2000);
+      await new Promise(r => setTimeout(r, 2000))
       
       // Check if we hit a rate limit
       if (await rateLimiter.handleRateLimit(page)) {
@@ -656,7 +686,8 @@ async function sendOneConnectionRequest(page) {
           if (sendButton) {
             console.log(`Found send button with selector: ${sendSelector}`);
             await sendButton.click();
-            await page.waitForTimeout(2000);
+            //await page.waitForTimeout(2000);
+            await new Promise(r => setTimeout(r, 2000))
             break;
           }
         } catch (error) {
@@ -755,7 +786,8 @@ async function checkForSmsVerification(page) {
 
     await tryAnotherWay.click()
 
-    await page.waitForTimeout(5000)
+    //await page.waitForTimeout(5000)
+    await new Promise(r => setTimeout(r, 5000))
 
     // Wait for the SMS code input field
     const smsInput = await page.waitForSelector('input#input__phone_verification_pin', { timeout: 15000 });
@@ -766,7 +798,8 @@ async function checkForSmsVerification(page) {
     // Prompt for SMS code from the user
     const smsCode = await promptForInput('Enter the SMS verification code: ');
     await smsInput.click();
-    await page.waitForTimeout(500);
+    //await page.waitForTimeout(500);
+    await new Promise(r => setTimeout(r, 500))
     await smsInput.type(smsCode, { delay: 100 });
     console.log('SMS code entered.');
 
@@ -870,277 +903,108 @@ async function loginWithCredentials(page, username, password) {
       timeout: 80000
     });
 
-    // Check for "Welcome back" single-field login
-    const welcomeBackText = await page.$eval('h1, .header__content', el => el.textContent.toLowerCase().trim())
-      .catch(() => '');
-    const isSingleFieldLogin = welcomeBackText.includes('welcome back');
+    // Wait for username field and type username
+    await page.waitForSelector('#username');
+    await page.type('#username', username);
 
-    if (isSingleFieldLogin) {
-      console.log('Detected "Welcome back" single-field login...');
-      // Only password field should be present
-      await page.waitForSelector('#password', { timeout: 80000 });
-      // Type password with random delays
-      await page.type('#password', password, { delay: Math.floor(Math.random() * 100) + 50 });
-    } else {
-      // Standard login form with both username and password fields
-      console.log('Standard login form detected...');
+    // Wait for password field and type password
+    await page.waitForSelector('#password');
+    await page.type('#password', password);
 
-      // Wait for login form
-      await page.waitForSelector('#username', { timeout: 80000 });
-      await page.waitForSelector('#password', { timeout: 80000 });
+    // Click sign in button
+    await page.click('button[type="submit"]');
 
-      // Type credentials with random delays
-      // Simulate human-like typing for username with variable delays and occasional pauses
-      for (const char of username) {
-        // Add random delay between keystrokes (50-200ms)
-        const baseDelay = Math.floor(Math.random() * 150) + 50;
-        
-        // 10% chance of a longer pause (500-1500ms) to simulate human thinking
-        const delay = Math.random() < 0.1 ? 
-          baseDelay + Math.floor(Math.random() * 1000) + 500 :
-          baseDelay;
-          
-        await page.type('#username', char, { delay });
+    // Wait for navigation
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 80000 })
+      .catch(error => logger.warn('Navigation timeout after login:', error));
+
+    // Check if we're still on the login page (failed login)
+    if (page.url().includes('/login')) {
+      const errorElement = await page.$('div[error-for="username"], div[error-for="password"]');
+      if (errorElement) {
+        const errorText = await page.evaluate(el => el.textContent, errorElement);
+        throw new Error(`Login failed: ${errorText.trim()}`);
       }
-
-        // Natural pause between username and password fields (1-3 seconds)
-        await page.waitForTimeout(Math.floor(Math.random() * 2000) + 1000);
-
-        // Simulate human-like typing for password with variable delays and occasional pauses
-        for (const char of password) {
-          const baseDelay = Math.floor(Math.random() * 150) + 50;
-          
-          // 10% chance of a longer pause
-          const delay = Math.random() < 0.1 ?
-            baseDelay + Math.floor(Math.random() * 1000) + 500 :
-            baseDelay;
-            
-          await page.type('#password', char, { delay });
-        }
     }
 
-    await page.waitForTimeout(2000)
+    // Check for security challenge
+    if (page.url().includes('/checkpoint/challenge')) {
+      logger.info('Security challenge detected');
+      await saveScreenshot(page, 'security-challenge', 'security challenge page');
+      
+      // Wait for any security verification elements
+      //await page.waitForTimeout(2000);
+      await new Promise(r => setTimeout(r, 2000))
+      
+      // Check for various security elements
+      const hasSecurityVerification = await page.evaluate(() => {
+        const pageText = document.body.innerText.toLowerCase();
+        return pageText.includes('verify') || 
+               pageText.includes('security check') || 
+               pageText.includes('confirm it\'s you');
+      });
 
-    // Click sign in and wait for navigation
-    await Promise.all([
-      page.click('button[type="submit"]'),
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 80000 })
-    ]);
+      if (hasSecurityVerification) {
+        // Try to find and click the verify button
+        const verifyButton = await page.$('button:not([aria-hidden="true"]):is(:has(span:contains("Verify")), :contains("Verify"))');
+        if (verifyButton) {
+          logger.info('Found verify button, attempting to click...');
+          await verifyButton.click();
+          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 })
+            .catch(() => logger.warn('Navigation timeout after clicking verify'));
+        }
 
-    // Check for FunCaptcha after login attempt
-    if (page.url().includes('checkpoint') || page.url().includes('authwall')) {
+        // Wait to see if we need to handle additional verification
+        //await page.waitForTimeout(3000);
+        await new Promise(r => setTimeout(r, 3000))
+        
+        // If we're still on a challenge page, we need manual intervention
+        if (page.url().includes('/checkpoint/challenge')) {
+          throw new Error('Manual security verification required');
+          
+        }
+      }
+    }
+
+    // Check for unusual activity detection
+    if (page.url().includes('/checkpoint/challenge/verification')) {
       logger.info('Detected potential captcha challenge...');
       await saveScreenshot(page, 'captcha-challenge', 'captcha challenge page');
 
-      // Store current URL before solving captcha
-      const currentUrl = page.url();
-      
-      // Try to solve FunCaptcha if present
-      const token = await captchaSolver.solveFunCaptcha(page, currentUrl);
-      if (token) {
-        logger.info('Successfully obtained captcha solution');
-        // Wait for the solution to be applied and page to update
-        await page.waitForTimeout(2000);
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 80000 })
-          .catch(error => logger.warn('Navigation timeout after captcha solution:', error));
-      } else {
-        logger.warn('Failed to solve captcha challenge');
-      }
-    }
-
-    // Configure browser stealth settings
-    await page.evaluateOnNewDocument(() => {
-      // Overwrite navigator properties
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-
-      // Add missing chrome properties
-      window.chrome = {
-        runtime: {},
-        loadTimes: function () { },
-        csi: function () { },
-        app: {}
-      };
-
-      // Modify permissions behavior
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-          Promise.resolve({ state: Notification.permission }) :
-          originalQuery(parameters)
-      );
-    });
-
-    // Set a realistic user agent with random minor version
-    const minorVersion = Math.floor(Math.random() * 99);
-    const userAgent = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36`;
-    await page.setUserAgent(userAgent);
-
-    // Check if we need to rotate proxy
-    if (sessionManager.shouldRotateProxy()) {
-      const newProxy = await proxyManager.getRandomProxy();
-      if (newProxy) {
-        // Clear all cookies and cache before switching proxy
-        try {
-          const client = await page.target().createCDPSession();
-          await Promise.all([
-            client.send('Network.clearBrowserCookies'),
-            client.send('Network.clearBrowserCache'),
-            // Set custom request headers
-            client.send('Network.setExtraHTTPHeaders', {
-              headers: {
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"macOS"',
-                'Upgrade-Insecure-Requests': '1', 
-                'User-Agent': userAgent,
-                'sec-fetch-dest': 'document',
-                'sec-fetch-mode': 'navigate',
-                'sec-fetch-site': 'none',
-                'sec-fetch-user': '?1'
-              }
-            })
-          ]);
-          sessionManager.markProxyRotated();
-          logger.info('Rotated to new proxy and cleared session data');
-        } catch (error) {
-          logger.error('Error setting up browser session:', error);
+      // Check for captcha
+      const captchaFrame = await page.$('iframe[title*="archetype"]');
+      if (captchaFrame) {
+        logger.info('Detected FunCaptcha challenge, extracting key...');
+        const key = await captchaSolver.extractFunCaptchaKey(page);
+        if (key) {
+          logger.info('Found FunCaptcha key, attempting to solve...');
+          const token = await captchaSolver.solveFunCaptcha(page, page.url());
+          if (token) {
+            logger.info('Successfully obtained captcha solution');
+            await page.waitForTimeout(2000);
+            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 80000 })
+              .catch(error => logger.warn('Navigation timeout after captcha solution:', error));
+          }
+        } else {
+          logger.warn('Could not find FunCaptcha key, captcha solving may fail');
         }
       }
     }
 
-    console.log('Navigating to LinkedIn login page...');
-    await page.goto('https://www.linkedin.com/login', {
-      waitUntil: 'domcontentloaded',
-      timeout: 80000
-    });
-
-    // Simulate human typing behavior for username
-    console.log('Entering username...');
-    for (let i = 0; i < username.length; i++) {
-      const delay = Math.random() < 0.1 ?
-        Math.floor(Math.random() * 1000 + 500) : // Occasional pause
-        Math.floor(Math.random() * 150 + 50);   // Normal typing
-
-      await page.type('#username', username[i], { delay: 120 });
-      await page.waitForTimeout(delay);
+    // Check for SMS verification
+    if (await checkForSmsVerification(page)) {
+      throw new Error('SMS verification required');
     }
 
-    // Natural pause between username and password
-    await page.waitForTimeout(Math.floor(Math.random() * 2000 + 1000));
-
-    console.log('Entering password...');
-    for (let i = 0; i < password.length; i++) {
-      const delay = Math.random() < 0.1 ?
-        Math.floor(Math.random() * 1000 + 500) : // Occasional pause
-        Math.floor(Math.random() * 150 + 50);   // Normal typing
-
-      await page.type('#password', password[i], { delay: 120 });
-      await page.waitForTimeout(delay);
-    }
-
-    // Natural pause after entering credentials
-    await page.waitForTimeout(Math.floor(Math.random() * 3000 + 1500));
-
-    // Click sign in button and handle navigation with fallbacks
-    console.log('Clicking sign in button...');
-
-    // Take screenshot before clicking sign in
-    await saveScreenshot(page, 'before-signin-click', 'Before clicking sign in button');
-
-    const signInButton = await page.$('button[type="submit"]');
-    if (signInButton) {
-      await signInButton.click();
-    } else {
-      // Fallback: Click on any button with text "Sign in"
-      const signInButtons = await page.$$('button:has-text("Sign in")');
-      if (signInButtons.length > 0) {
-        await signInButtons[0].click();
-      }
-    }
-
-    // Wait for navigation to complete
-    await page.waitForNavigation({ waitUntil: 'networkidle2' });
-
-    // Take screenshot after sign in
-    await saveScreenshot(page, 'after-signin', 'After sign in');
-
-    // check if login email or password is incorrect
-    const errorMessage = await page.$('div[data-test-id="alert-message"]');
-    if (errorMessage) {
-      const errorText = await errorMessage.evaluate(el => el.textContent);
-      console.error(`Login error: ${errorText}`);
-      await saveScreenshot(page, 'login-error', 'Login error screenshot');
-      return false;
-    }
-
-    // Check if we've been redirected to a checkpoint/challenge page
-    const currentUrl = page.url();
-    if (currentUrl.includes('/checkpoint')) {
-      // Check for puzzle captcha text
-      const pageContent = await page.content();
-      const hasPuzzleCaptcha = pageContent.includes("security check");
-
-      // check for puzzle security challenge (captcha)
-      const hasPuzzleSecurityChallenge = await page.$('.challenge-card');
-
-      // Check for text indicating a security challenge
-      const hasSecurityText = pageContent.toLowerCase().includes('security check');
-
-      // Check for captcha iframe
-      const hasCaptchaIframe = await page.$('iframe[src*="captcha"]');
-
-      // Check for reCAPTCHA elements
-      const hasReCaptcha = await page.$('div.g-recaptcha') || await page.$('iframe[src*="recaptcha"]');
-
-      if (hasPuzzleSecurityChallenge || hasSecurityText || hasCaptchaIframe || hasReCaptcha) {
-        console.log('Detected puzzle captcha challenge.');
-        await saveScreenshot(page, 'security-challenge', 'Security challenge or captcha detected');
-
-        await page.waitForTimeout(60000)
-
-        console.log('Please solve the puzzle manually.');
-        await saveScreenshot(page, 'puzzle-captcha', 'Puzzle captcha challenge screenshot');
-        return false;
-      }
-
-      // Check if SMS verification is needed by looking for 'Enter the code' text
-      const hasEnterCodeText = await page.evaluate(() => {
-        return document.body.innerText.includes('Enter the code');
-      });
-
-      if (hasEnterCodeText) {
-        console.log('Detected SMS verification challenge. Initiating SMS verification...');
-        await checkForSmsVerification(page);
-      } else {
-        console.log('SMS verification challenge not detected.');
-      }
-
-      return false;
-    } else {
-      console.log('No checkpoint challenge detected. Continuing with normal flow...');
-    }
-
-    // Check if login was successful
-    const isLoggedIn = await checkIfLoggedIn(page);
-    if (!isLoggedIn) {
-      console.error('Login failed!');
-      await saveScreenshot(page, 'login-failed', 'Login failed screenshot');
-      return false;
-    }
-
-    console.log('Login successful!');
-
+    // If we've made it here without any challenges, we're logged in
+    logger.info('Successfully logged in');
+    await saveCookies(page);
     return true;
 
   } catch (error) {
-    console.log(error)
-    console.error(`Login error: ${error.message}`);
-    await saveScreenshot(page, 'login-error', 'Login error screenshot');
-    return false;
+    logger.error('Login error:', error);
+    await saveScreenshot(page, 'login-error', 'login error page');
+    throw error;
   }
 }
 
@@ -1180,13 +1044,16 @@ async function useVision(page, screenshot, action = 'solve-puzzle', prompt = 'Id
     });
 
     // Add small random delay before clicking
-    await page.waitForTimeout(Math.random() * 500 + 200);
+    // await page.waitForTimeout(Math.random() * 500 + 200);
+    await new Promise(r => setTimeout(r, Math.random() * 500 + 200))
 
     // Click to rotate puzzle
     await page.mouse.click(clickX, clickY);
 
     // Wait for rotation animation
-    await page.waitForTimeout(1000);
+    // await page.waitForTimeout(1000);
+
+    await new Promise(r => setTimeout(r, 1000))
 
     // Save screenshot for verification
     await saveScreenshot(page, action, action);

@@ -2,28 +2,69 @@ import { logger } from './logger.mjs';
 
 class RateLimiter {
   constructor() {
-    this.dailyConnectionLimit = 100; // LinkedIn's recommended limit
-    this.dailyMessageLimit = 100;
-    this.minActionDelay = 30000; // 30 seconds minimum between actions
-    this.maxActionDelay = 120000; // 2 minutes maximum between actions
+    // LinkedIn's recommended weekly limit is ~100, so we'll stay well below that
+    this.dailyConnectionLimit = 15; // More conservative daily limit
+    this.weeklyConnectionLimit = 80;
+    this.dailyMessageLimit = 50;
+    
+    // More human-like delays with wider variance
+    this.minActionDelay = 45000; // 45 seconds minimum
+    this.maxActionDelay = 180000; // 3 minutes maximum
+    this.typeDelayBase = 150; // Base typing delay in ms
+    
+    // Counters
     this.connectionCount = 0;
+    this.weeklyConnectionCount = 0;
     this.messageCount = 0;
     this.lastActionTime = 0;
     this.lastResetDate = new Date().toDateString();
+    this.lastWeeklyReset = new Date().toDateString();
+    
+    // Progressive delays for failed attempts
+    this.consecutiveFailures = 0;
+    this.backoffMultiplier = 1;
   }
 
-  async resetDailyCounters() {
+  async resetCounters() {
     const currentDate = new Date().toDateString();
+    const currentDay = new Date().getDay();
+    
+    // Reset daily counters
     if (currentDate !== this.lastResetDate) {
       this.connectionCount = 0;
       this.messageCount = 0;
       this.lastResetDate = currentDate;
       logger.info('Daily rate limits reset');
     }
+    
+    // Reset weekly counters on Monday
+    if (currentDay === 1 && currentDate !== this.lastWeeklyReset) {
+      this.weeklyConnectionCount = 0;
+      this.lastWeeklyReset = currentDate;
+      logger.info('Weekly rate limits reset');
+      // Reset backoff on weekly reset
+      this.consecutiveFailures = 0;
+      this.backoffMultiplier = 1;
+    }
   }
 
   getRandomDelay() {
-    return Math.floor(Math.random() * (this.maxActionDelay - this.minActionDelay + 1)) + this.minActionDelay;
+    // Use a more natural distribution (gaussian-like)
+    const baseDelay = (this.maxActionDelay + this.minActionDelay) / 2;
+    const variance = (this.maxActionDelay - this.minActionDelay) / 4;
+    
+    // Sum of multiple random numbers approaches normal distribution
+    let delay = 0;
+    for (let i = 0; i < 3; i++) {
+      delay += Math.random() * variance;
+    }
+    delay = baseDelay + (delay - (variance * 1.5));
+    
+    // Apply backoff multiplier for consecutive failures
+    delay *= this.backoffMultiplier;
+    
+    // Ensure delay stays within bounds
+    return Math.max(this.minActionDelay, Math.min(this.maxActionDelay * 3, delay));
   }
 
   async waitForNextAction() {
@@ -43,11 +84,26 @@ class RateLimiter {
   }
 
   async checkConnectionLimit() {
-    await this.resetDailyCounters();
+    await this.resetCounters();
+    
+    // Check both daily and weekly limits
     if (this.connectionCount >= this.dailyConnectionLimit) {
       logger.warn('Daily connection limit reached');
       return false;
     }
+    
+    if (this.weeklyConnectionCount >= this.weeklyConnectionLimit) {
+      logger.warn('Weekly connection limit reached');
+      return false;
+    }
+    
+    // Add time-of-day restrictions
+    const hour = new Date().getHours();
+    if (hour < 8 || hour > 22) { // Only operate during business hours
+      logger.info('Outside of operating hours (8 AM - 10 PM)');
+      return false;
+    }
+    
     return true;
   }
 
@@ -61,9 +117,10 @@ class RateLimiter {
   }
 
   async incrementConnectionCount() {
-    await this.resetDailyCounters();
+    await this.resetCounters();
     this.connectionCount++;
-    logger.info(`Connection count: ${this.connectionCount}/${this.dailyConnectionLimit}`);
+    this.weeklyConnectionCount++;
+    logger.info(`Connection count: ${this.connectionCount}/${this.dailyConnectionLimit} daily, ${this.weeklyConnectionCount}/${this.weeklyConnectionLimit} weekly`);
   }
 
   async incrementMessageCount() {
@@ -76,20 +133,36 @@ class RateLimiter {
     const rateLimitSelectors = [
       '.artdeco-modal__content:contains("rate limit")',
       '.artdeco-modal__content:contains("too many requests")',
-      '.artdeco-modal__content:contains("try again later")'
+      '.artdeco-modal__content:contains("try again later")',
+      '.artdeco-modal__content:contains("unusual activity")',
+      '.artdeco-modal__content:contains("security check")',
+      'form#challenge'
     ];
 
     for (const selector of rateLimitSelectors) {
       try {
         const element = await page.$(selector);
         if (element) {
-          logger.warn('Rate limit detected, waiting for 1 hour...');
-          await new Promise(resolve => setTimeout(resolve, 3600000)); // Wait 1 hour
+          this.consecutiveFailures++;
+          
+          // Exponential backoff with max cap
+          const baseDelay = 3600000; // 1 hour base delay
+          this.backoffMultiplier = Math.min(Math.pow(2, this.consecutiveFailures - 1), 8);
+          const waitTime = baseDelay * this.backoffMultiplier;
+          
+          logger.warn(`Rate limit detected (attempt ${this.consecutiveFailures}), waiting for ${waitTime/3600000} hours...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
           return true;
         }
       } catch (error) {
         logger.error('Error checking rate limit', error);
       }
+    }
+    
+    // If we get here, no rate limit was detected
+    if (this.consecutiveFailures > 0) {
+      this.consecutiveFailures = Math.max(0, this.consecutiveFailures - 1); // Gradually reduce failures
+      this.backoffMultiplier = Math.max(1, this.backoffMultiplier * 0.75); // Gradually reduce backoff
     }
     return false;
   }

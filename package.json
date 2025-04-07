@@ -10,7 +10,8 @@
   "dependencies": {
     "dayjs": "^1.11.9",
     "dotenv": "^16.4.7",
-    "puppeteer": "^21.0.0"
+    "puppeteer": "npm:rebrowser-puppeteer@^23.3.1",
+    "puppeteer-core": "npm:rebrowser-puppeteer-core@^23.3.1"
   },
   "pnpm": {
     "ignoredBuiltDependencies": [

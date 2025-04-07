@@ -1,5 +1,13 @@
 import fetch from 'node-fetch';
 import { logger } from './logger.mjs';
+
+const FUNCAPTCHA_KEY_PATTERNS = [
+  /public_key:\s*['"](.*?)['"]/, // Standard format
+  /data-pkey=['"]([^'"]*)['"]/, // HTML attribute format
+  /arkose\..*?key:\s*['"](.*?)['"]/, // Arkose format
+  /\.funcaptcha\(\{[^}]*public_key:\s*['"](.*?)['"]/, // FunCaptcha initialization
+  /ArkoseEnforcement[^}]*pk:\s*['"](.*?)['"]/ // Arkose enforcement
+];
 import { setTimeout as wait } from 'timers/promises';
 import { proxyManager } from './proxy-manager.mjs';
 
@@ -8,7 +16,69 @@ class CaptchaSolver {
     this.apiKey = process.env.ANTICAPTCHA_API_KEY;
     this.enabled = process.env.USE_ANTICAPTCHA === 'true';
     this.maxRetries = 3;
-    this.retryDelay = 2000; // 2 seconds
+    this.retryDelay = 5000;
+    
+    // FunCaptcha key handling
+    this.funcaptchaKey = null;
+    this.lastKeyCheck = null;
+    this.keyCheckInterval = 3600000; // 1 hour
+  }
+
+  async extractFunCaptchaKey(page) {
+    try {
+      // Check if we have a recent key
+      if (this.funcaptchaKey && this.lastKeyCheck && 
+          (Date.now() - this.lastKeyCheck) < this.keyCheckInterval) {
+        return this.funcaptchaKey;
+      }
+
+      // Get page content
+      const content = await page.content();
+      
+      // Try to find the key using different patterns
+      for (const pattern of FUNCAPTCHA_KEY_PATTERNS) {
+        const match = content.match(pattern);
+        if (match && match[1]) {
+          this.funcaptchaKey = match[1];
+          this.lastKeyCheck = Date.now();
+          logger.info(`Found FunCaptcha public key: ${this.funcaptchaKey}`);
+          return this.funcaptchaKey;
+        }
+      }
+
+      // Try to find key in external scripts
+      const scripts = await page.$$eval('script[src]', scripts => 
+        scripts.map(script => script.src)
+          .filter(src => src.includes('arkose') || src.includes('funcaptcha'))
+      );
+
+      for (const scriptUrl of scripts) {
+        try {
+          const response = await page.evaluate(async (url) => {
+            const res = await fetch(url);
+            return res.text();
+          }, scriptUrl);
+
+          for (const pattern of FUNCAPTCHA_KEY_PATTERNS) {
+            const match = response.match(pattern);
+            if (match && match[1]) {
+              this.funcaptchaKey = match[1];
+              this.lastKeyCheck = Date.now();
+              logger.info(`Found FunCaptcha public key in external script: ${this.funcaptchaKey}`);
+              return this.funcaptchaKey;
+            }
+          }
+        } catch (error) {
+          logger.error(`Error fetching external script ${scriptUrl}:`, error);
+        }
+      }
+
+      logger.warn('Could not find FunCaptcha public key');
+      return null;
+    } catch (error) {
+      logger.error('Error extracting FunCaptcha key:', error);
+      return null;
+    }
   }
 
   async solveFunCaptcha(page, pageUrl) {
@@ -78,7 +148,7 @@ class CaptchaSolver {
           const src = script.src;
           if (src && src.includes('arkoselabs.com')) {
             // https://client-api.arkoselabs.com/fc/gt2/public_key/3117BF26-4762-4F5A-8ED9-A85E69209A46
-            const match = src.match(/https:\/\/([^/]+)\.arkoselabs\.com\/fc\/gt2\/public_key\/([^/]+)\//);
+            const match = src.match(/https:\/\/([^/]+)\.arkoselabs\.com\/fc\/gt2\/public_key\/([^/]+)(\/|$)/);
             if (match) {
               subdomain = match[1];
               publicKey = match[2];
